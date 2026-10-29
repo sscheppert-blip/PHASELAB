@@ -584,8 +584,13 @@ void testLinkAcrossProcesses (const juce::String& prefix)
     writer.release (*slotA);
     child.waitForProcessToFinish (6000);
 
-    check (started && otherProcess && best.state == LinkState::valid && best.result.offsetSamples == delay,
-           "link: a source in another process is joined sample-accurately (O-04)");
+    const bool ok = started && otherProcess && best.state == LinkState::valid && best.result.offsetSamples == delay;
+    if (! ok)
+        std::printf ("      started=%d slots=%d/%d otherProcess=%d last state=%d best offset=%d position=%lld child exit=%u\n",
+                     (int) started, (int) (slotA != nullptr), (int) (slotB != nullptr), (int) otherProcess,
+                     (int) bus.getStatus().state, best.result.offsetSamples, (long long) position,
+                     (unsigned) child.getExitCode());
+    check (ok, "link: a source in another process is joined sample-accurately (O-04)");
 }
 
 //==============================================================================
