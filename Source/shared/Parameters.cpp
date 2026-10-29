@@ -18,6 +18,12 @@ juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout (Role 
         juce::ParameterID { ids::bandCutoff, 1 }, "Mono-Score Grenzfrequenz", cutoffRange, 120.0f,
         juce::AudioParameterFloatAttributes().withLabel ("Hz")));
 
+    // Comparison group: a Bus Analyzer reads slots A and B of its group (sources are assigned
+    // explicitly, never by track name).
+    layout.add (std::make_unique<juce::AudioParameterChoice> (
+        juce::ParameterID { ids::group, 1 }, "Gruppe",
+        juce::StringArray { "Gruppe 1", "Gruppe 2", "Gruppe 3", "Gruppe 4" }, 0));
+
     if (role == Role::channel)
     {
         layout.add (std::make_unique<juce::AudioParameterChoice> (

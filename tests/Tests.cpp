@@ -1,10 +1,13 @@
-// Offline tests for the analysis core and the shared processor.
+// Offline tests for the analysis core, the shared processor and the link (P1 harness).
 //   PhaseLabTests                               run all tests
-//   PhaseLabTests --snapshot <png> channel|bus [send|mono]
+//   PhaseLabTests --snapshot <png> channel|bus [send|mono|linked]
 //                                               render the panel after feeding a test signal
+//   PhaseLabTests --link-child <prefix> <seconds> <delay>
+//                                               internal: second process sending source B
 
 #include "core/MonoScore.h"
 #include "shared/AnalyzerProcessor.h"
+#include "transport/Link.h"
 
 #include <juce_audio_utils/juce_audio_utils.h>
 
@@ -226,6 +229,357 @@ void testProcessor (Role role, const char* name)
     check (editor != nullptr && editor->getWidth() > 0, (prefix + "editor opens").toRawUTF8());
 }
 
+//==============================================================================
+// Link: Channel Analyzer → Bus Analyzer (P1, docs/spec/08)
+//==============================================================================
+
+// Reproducible test signal: the same value for the same timeline position, in every process.
+float noiseAt (std::int64_t t)
+{
+    std::uint64_t z = (std::uint64_t) t + 0x9e3779b97f4a7c15ull;
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+    z ^= z >> 31;
+    return (float) ((double) (z >> 11) / 9007199254740992.0 - 0.5);
+}
+
+class TestHead final : public juce::AudioPlayHead
+{
+public:
+    juce::Optional<PositionInfo> getPosition() const override
+    {
+        PositionInfo info;
+        if (hasTime)
+            info.setTimeInSamples (timeline);
+        info.setIsPlaying (playing);
+        return info;
+    }
+
+    std::int64_t timeline = 0;
+    bool playing = true;
+    bool hasTime = true;
+};
+
+// A Channel Analyzer with its own playhead, fed with a function of the timeline position.
+struct Source
+{
+    Source (int slot, int groupIndex, std::function<float (std::int64_t)> f) : signal (std::move (f))
+    {
+        p.setPlayConfigDetails (2, 2, rate, 512);
+        p.prepareToPlay (rate, 512);
+        p.setPlayHead (&head);
+        setParameter (p, ids::mode, (float) ChannelMode::sendOnly);
+        setParameter (p, ids::slot, (float) slot);
+        setParameter (p, ids::group, (float) groupIndex);
+        p.maintainLink();
+    }
+
+    // Processes up to timeline position `until` in blocks of `block` samples.
+    void runUntil (std::int64_t until, int block)
+    {
+        juce::MidiBuffer midi;
+        while (position < until)
+        {
+            const int n = (int) std::min<std::int64_t> (block, until - position);
+            juce::AudioBuffer<float> buffer (2, n);
+            for (int i = 0; i < n; ++i)
+            {
+                const float v = signal (position + i);
+                buffer.setSample (0, i, v);
+                buffer.setSample (1, i, v);
+            }
+            head.timeline = position;
+            p.processBlock (buffer, midi);
+            position += n;
+        }
+    }
+
+    AnalyzerProcessor p { Role::channel };
+    TestHead head;
+    std::function<float (std::int64_t)> signal;
+    std::int64_t position = 0;
+};
+
+struct Bus
+{
+    Bus()
+    {
+        p.setPlayConfigDetails (2, 2, rate, 512);   // no prepareToPlay: the tests drive step() themselves
+    }
+    BusLinkStatus step() { p.getBusLink()->step (link::nowMs()); return p.getLinkStatus(); }
+    AnalyzerProcessor p { Role::bus };
+};
+
+// Runs A and B to `end` with different block sizes, B first, and returns the bus result.
+BusLinkStatus runPair (Source& a, Source& b, Bus& bus, std::int64_t end, int blockA = 256, int blockB = 100)
+{
+    for (std::int64_t t = a.position; t < end;)
+    {
+        t = std::min (end, t + 4096);
+        b.runUntil (t, blockB);   // inverted callback order: the later source is processed first
+        a.runUntil (t, blockA);
+        bus.step();
+    }
+    return bus.step();
+}
+
+void testLinkSync()
+{
+    // Known offsets survive the join exactly, independent of block split and callback order (T-07).
+    for (int delay : { 0, 1, -1, 20 })
+    {
+        Source a (0, 0, [] (std::int64_t t) { return noiseAt (t); });
+        Source b (1, 0, [delay] (std::int64_t t) { return noiseAt (t - delay); });
+        Bus bus;
+        const auto s = runPair (a, b, bus, 48000);
+        const auto what = "link: offset of " + juce::String (delay) + " samples is measured exactly (VALID)";
+        check (s.state == LinkState::valid && s.result.clearOffset && s.result.offsetSamples == delay
+                   && s.result.offsetCorrelation > 0.99,
+               what.toRawUTF8());
+    }
+
+    {
+        Source a (0, 0, [] (std::int64_t t) { return noiseAt (t); });
+        Source b (1, 0, [] (std::int64_t t) { return -noiseAt (t); });
+        Bus bus;
+        const auto s = runPair (a, b, bus, 48000, 512, 64);
+        check (s.state == LinkState::valid && s.result.polarityHint && s.result.offsetSamples == 0
+                   && s.result.correlation < -0.99 && s.result.sumScore == 0,
+               "link: opposite polarity gives a polarity hint and sum score 0");
+    }
+
+    {
+        Source a (0, 0, [] (std::int64_t t) { return 0.4f * sine (60, (int) t); });
+        Source b (1, 0, [] (std::int64_t t) { return 0.4f * sine (60, (int) t); });
+        Bus bus;
+        const auto s = runPair (a, b, bus, 48000);
+        check (s.state == LinkState::valid && s.result.sumScore >= 99, "link: identical bass adds up fully (sum score 100)");
+    }
+
+    {
+        // Real kick/bass material is often unrelated: that is no error, just no offset to name.
+        Source a (0, 0, [] (std::int64_t t) { return noiseAt (t); });
+        Source b (1, 0, [] (std::int64_t t) { return noiseAt (t + 1000003); });
+        Bus bus;
+        const auto s = runPair (a, b, bus, 48000);
+        check (s.state == LinkState::valid && ! s.result.clearOffset, "link: unrelated signals name no offset");
+    }
+}
+
+void testLinkStates()
+{
+    {
+        Source a (0, 0, [] (std::int64_t t) { return noiseAt (t); });
+        Bus bus;
+        a.runUntil (24000, 256);
+        check (bus.step().state == LinkState::disconnected, "link: only A present → disconnected");
+    }
+
+    {
+        Source a (0, 0, [] (std::int64_t t) { return noiseAt (t); });
+        Source b (1, 0, [] (std::int64_t t) { return noiseAt (t); });
+        a.head.playing = b.head.playing = false;
+        Bus bus;
+        check (runPair (a, b, bus, 24000).state == LinkState::noHostTime, "link: stopped transport → no A/B comparison (T-08)");
+    }
+
+    {
+        Source a (0, 0, [] (std::int64_t t) { return noiseAt (t); });
+        Source b (1, 0, [] (std::int64_t t) { return noiseAt (t); });
+        Bus bus;
+        runPair (a, b, bus, 48000);
+        // Seek: both jump to 10 s. The newest window is incomplete until 400 ms of the new run arrived.
+        a.position = b.position = 480000;
+        const auto afterSeek = runPair (a, b, bus, 480000 + 4800);
+        const auto recovered = runPair (a, b, bus, 480000 + 24000);
+        check (afterSeek.state == LinkState::gap && recovered.state == LinkState::valid,
+               "link: seek invalidates the window, then recovers (T-08)");
+    }
+
+    {
+        Source a (0, 0, [] (std::int64_t t) { return noiseAt (t); });
+        Source b (1, 1, [] (std::int64_t t) { return noiseAt (t); });   // other group
+        Bus bus;
+        check (runPair (a, b, bus, 24000).state == LinkState::disconnected, "link: a source of another group is never used");
+    }
+
+    {
+        Source a (0, 0, [] (std::int64_t t) { return noiseAt (t); });
+        Source second (0, 0, [] (std::int64_t t) { return noiseAt (t); });   // also wants slot A
+        a.runUntil (2048, 256);
+        second.runUntil (2048, 256);
+        const bool busy = second.p.getSendState() == SendState::busy && a.p.getSendState() == SendState::sending;
+        setParameter (a.p, ids::mode, (float) ChannelMode::analyse);   // A stops sending and frees the slot
+        a.runUntil (2304, 256);
+        second.runUntil (2304, 256);
+        check (busy && second.p.getSendState() == SendState::sending,
+               "link: a second sender on the same slot is refused, takes over once it is free (T-09)");
+    }
+
+    // Raw writers with a fake clock for timing cases the processor cannot fake.
+    link::SlotTable table;
+    auto* slotA = table.acquire (2, 0);
+    auto* slotB = table.acquire (2, 1);
+    std::atomic<float> groupValue { 2.0f }, cutoffValue { 120.0f };
+
+    auto writeRun = [] (link::Writer& w, link::SlotLayout& s, std::int64_t from, std::int64_t to, std::int64_t now,
+                        double sampleRate = rate, bool offline = false)
+    {
+        std::vector<float> block (256);
+        for (std::int64_t t = from; t < to; t += 256)
+        {
+            for (int i = 0; i < 256; ++i)
+                block[(size_t) i] = noiseAt (t + i);
+            link::BlockTiming timing;
+            timing.hostTime = true;
+            timing.timeline = t;
+            timing.sampleRate = sampleRate;
+            timing.offline = offline;
+            w.write (s, block.data(), block.data(), 256, timing, now);
+        }
+    };
+
+    {
+        link::Writer wa (11), wb (12);
+        BusLink bus (groupValue, cutoffValue);
+        const auto t0 = link::nowMs();
+        writeRun (wa, *slotA, 0, 48000, t0);
+        writeRun (wb, *slotB, 0, 48000, t0);
+        bus.step (t0);
+        const bool validFirst = bus.getStatus().state == LinkState::valid;
+
+        // Loop: A plays the first 0.5 s again 3 s later, B has not got there yet. Same positions,
+        // different passes – must not be compared.
+        writeRun (wa, *slotA, 0, 24064, t0 + 3000);
+        bus.step (t0 + 3000);
+        const auto loopState = bus.getStatus().state;
+
+        bus.step (t0 + 3700);   // and then nothing for 700 ms
+        const auto staleState = bus.getStatus().state;
+        check (validFirst && loopState != LinkState::valid && staleState == LinkState::stale,
+               "link: loop passes are never mixed; a silent source turns stale (T-08, T-09)");
+        wa.release (*slotA);
+        wb.release (*slotB);
+    }
+
+    {
+        link::Writer wa (21), wb (22);
+        BusLink bus (groupValue, cutoffValue);
+        const auto t0 = link::nowMs() + 10000;   // past the staleness of the previous writers
+        writeRun (wa, *slotA, 0, 24064, t0, rate, true);
+        writeRun (wb, *slotB, 0, 24064, t0, rate, true);
+        bus.step (t0);
+        const bool offline = bus.getStatus().state == LinkState::offline;
+        writeRun (wa, *slotA, 24064, 48128, t0, rate);
+        writeRun (wb, *slotB, 24064, 48128, t0, 44100.0);
+        bus.step (t0);
+        check (offline && bus.getStatus().state == LinkState::rateMismatch,
+               "link: offline rendering is locked, different sample rates are refused (T-12)");
+        wa.release (*slotA);
+        wb.release (*slotB);
+    }
+
+    {
+        // Overflow: 4 s of audio before the bus looks once – more than the ring holds.
+        link::Writer wa (31), wb (32);
+        BusLink bus (groupValue, cutoffValue);
+        const auto t0 = link::nowMs() + 20000;
+        writeRun (wa, *slotA, 0, 192000, t0);
+        writeRun (wb, *slotB, 0, 192000, t0);
+        bus.step (t0);
+        const auto s = bus.getStatus();
+        check (s.state == LinkState::valid && s.result.offsetSamples == 0,
+               "link: ring overflow drops old data safely, the newest window stays valid (T-09)");
+        wa.release (*slotA);
+        wb.release (*slotB);
+    }
+}
+
+// Child process: sends source B with a known delay, paced like a realtime host.
+int runLinkChild (const juce::String& prefix, int seconds, int delay)
+{
+    link::setNamespace (prefix.toStdString());
+    link::SlotTable table;
+    auto* slot = table.acquire (0, 1);
+    if (slot == nullptr)
+        return 2;
+    link::Writer writer ((std::uint64_t) juce::Random::getSystemRandom().nextInt64() | 1u);
+    std::vector<float> block (256);
+    const auto start = juce::Time::getMillisecondCounterHiRes();
+    for (std::int64_t t = 0; t < (std::int64_t) seconds * 48000; t += 256)
+    {
+        for (int i = 0; i < 256; ++i)
+            block[(size_t) i] = noiseAt (t + i - delay);
+        link::BlockTiming timing;
+        timing.hostTime = true;
+        timing.timeline = t;
+        timing.sampleRate = rate;
+        writer.write (*slot, block.data(), block.data(), 256, timing, link::nowMs());
+        const double due = start + 1000.0 * (double) (t + 256) / rate;
+        const double wait = due - juce::Time::getMillisecondCounterHiRes();
+        if (wait > 1.0)
+            juce::Thread::sleep ((int) wait);
+    }
+    writer.release (*slot);
+    return 0;
+}
+
+void testLinkAcrossProcesses (const juce::String& prefix)
+{
+    // B comes from a separate process (sandboxed hosts, O-04), A from this one, both on the same timeline.
+    constexpr int delay = 7;
+    juce::ChildProcess child;
+    const auto exe = juce::File::getSpecialLocation (juce::File::currentExecutableFile).getFullPathName();
+    const bool started = child.start (juce::StringArray { exe, "--link-child", prefix, "3", juce::String (delay) }, 0);
+
+    link::SlotTable table;
+    auto* slotA = table.acquire (0, 0);
+    auto* slotB = table.acquire (0, 1);
+    std::atomic<float> groupValue { 0.0f }, cutoffValue { 120.0f };
+    BusLink bus (groupValue, cutoffValue);
+    link::Writer writer (41);
+    std::vector<float> block (256);
+    std::int64_t position = 0;
+    BusLinkStatus best;
+    bool otherProcess = false;
+
+    const auto until = juce::Time::getMillisecondCounter() + 5000;
+    while (started && slotA != nullptr && slotB != nullptr && juce::Time::getMillisecondCounter() < until)
+    {
+        // Follow B like a host would process both tracks in the same cycle.
+        const std::uint64_t records = slotB->recordsWritten.load();
+        if (records > 0)
+        {
+            otherProcess = true;
+            const auto& last = slotB->records[(records - 1) % link::recordCount];
+            const std::int64_t end = last.timeline.load() + (std::int64_t) last.length.load();
+            for (; position + 256 <= end; position += 256)
+            {
+                for (int i = 0; i < 256; ++i)
+                    block[(size_t) i] = noiseAt (position + i);
+                link::BlockTiming timing;
+                timing.hostTime = true;
+                timing.timeline = position;
+                timing.sampleRate = rate;
+                writer.write (*slotA, block.data(), block.data(), 256, timing, link::nowMs());
+            }
+        }
+        bus.step (link::nowMs());
+        const auto s = bus.getStatus();
+        if (s.state == LinkState::valid)
+            best = s;
+        if (best.state == LinkState::valid && position > 72000)
+            break;
+        juce::Thread::sleep (5);
+    }
+    writer.release (*slotA);
+    child.waitForProcessToFinish (6000);
+
+    check (started && otherProcess && best.state == LinkState::valid && best.result.offsetSamples == delay,
+           "link: a source in another process is joined sample-accurately (O-04)");
+}
+
+//==============================================================================
 int snapshot (const juce::String& path, const juce::String& roleName, const juce::String& option)
 {
     const Role role = roleName == "bus" ? Role::bus : Role::channel;
@@ -233,9 +587,24 @@ int snapshot (const juce::String& path, const juce::String& roleName, const juce
     p.setPlayConfigDetails (2, 2, rate, 256);
     p.prepareToPlay (rate, 256);
     if (role == Role::channel && option == "send")
+    {
         setParameter (p, ids::mode, (float) ChannelMode::sendOnly);
+        p.maintainLink();   // what the plugin's timer does a moment later
+    }
     if (option == "mono")
         p.setMonoMonitor (true);
+
+    // Bus snapshot with a linked kick/bass pair, B 20 samples late.
+    std::unique_ptr<Source> kick, bass;
+    if (role == Role::bus && option == "linked")
+    {
+        kick = std::make_unique<Source> (0, 0, [] (std::int64_t t) { return 0.6f * noiseAt (t) * 0.3f + 0.4f * sine (55, (int) t); });
+        bass = std::make_unique<Source> (1, 0, [] (std::int64_t t) { return 0.6f * noiseAt (t - 20) * 0.3f + 0.4f * sine (55, (int) (t - 20)); });
+        kick->runUntil (48000, 256);
+        bass->runUntil (48000, 128);
+        p.getBusLink()->stop();   // step by hand, not concurrently with the worker
+        p.getBusLink()->step (link::nowMs());
+    }
 
     // A wide pad over a mono bass, so both scores have something to show.
     juce::AudioBuffer<float> buffer (2, 256);
@@ -245,9 +614,9 @@ int snapshot (const juce::String& path, const juce::String& roleName, const juce
         for (int i = 0; i < 256; ++i)
         {
             const int n = block * 256 + i;
-            const float bass = 0.4f * sine (55, n);
-            buffer.setSample (0, i, bass + 0.2f * sine (660, n));
-            buffer.setSample (1, i, bass + 0.2f * sine (660, n + 30));
+            const float low = 0.4f * sine (55, n);
+            buffer.setSample (0, i, low + 0.2f * sine (660, n));
+            buffer.setSample (1, i, low + 0.2f * sine (660, n + 30));
         }
         p.processBlock (buffer, midi);
     }
@@ -271,7 +640,14 @@ int snapshot (const juce::String& path, const juce::String& roleName, const juce
 
 int main (int argc, char** argv)
 {
+    if (argc >= 5 && juce::String (argv[1]) == "--link-child")
+        return runLinkChild (argv[2], juce::String (argv[3]).getIntValue(), juce::String (argv[4]).getIntValue());
+
     juce::ScopedJuceInitialiser_GUI gui;
+
+    // Own shared-memory names, so the tests never meet a running DAW's PhaseLab instances.
+    const juce::String prefix = "t" + juce::String (juce::Random::getSystemRandom().nextInt (1 << 30));
+    link::setNamespace (prefix.toStdString());
 
     if (argc >= 4 && juce::String (argv[1]) == "--snapshot")
         return snapshot (argv[2], argv[3], argc >= 5 ? juce::String (argv[4]) : juce::String());
@@ -280,6 +656,9 @@ int main (int argc, char** argv)
     testBandScore();
     testProcessor (Role::channel, "Channel Analyzer");
     testProcessor (Role::bus, "Bus Analyzer");
+    testLinkSync();
+    testLinkStates();
+    testLinkAcrossProcesses (prefix);
 
     if (failures == 0)
         std::printf ("\nall tests passed\n");

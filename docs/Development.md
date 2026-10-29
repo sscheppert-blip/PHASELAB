@@ -19,14 +19,20 @@ AU on macOS).
 The test runner checks the mono score formula against its reference cases (identical, inverted, one
 channel, uncorrelated noise, silence), the band score, bit-identical pass-through for several block
 sizes, the *Send only* mode, the mono monitor, state recall (the mono monitor is never restored),
-the supported bus layouts and that the editor opens.
-`PhaseLabTests --snapshot <png> channel|bus [send|mono]` renders a panel after feeding a test signal.
+the supported bus layouts and that the editor opens. The link tests drive Channel Analyzers with
+their own playheads and check that known offsets (0, ±1, 20 samples) come out exactly with different
+block sizes and callback orders, polarity and sum score, stopped transport, seek, loop passes, a
+missing or stale source, group separation, slot conflicts, ring overflow, the offline lock, different
+sample rates and a source in a **second process** (the runner starts itself with `--link-child`).
+`docs/Hosttest.md` lists the checks that need a real DAW.
+`PhaseLabTests --snapshot <png> channel|bus [send|mono|linked]` renders a panel after feeding a test
+signal (`linked`: a Bus Analyzer with two sources, B 20 samples late).
 
 ### Build matrix
 
 | Platform | Formats | Built | Tested |
 |---|---|---|---|
-| Windows 11 x64 (MSVC 14.51, Ninja) | VST3, CLAP | yes, locally | own tests, pluginval strictness 10 (VST3) |
+| Windows 11 x64 (MSVC 14.51, Ninja) | VST3, CLAP | yes, locally | own tests incl. cross-process link, pluginval strictness 10 (VST3) |
 | macOS arm64 + x86_64 (universal) | AU, VST3, CLAP | not yet (release workflow / `tools/release-mac.sh`) | – |
 | Linux x64 (Ubuntu 24.04) | VST3, CLAP | not yet (release workflow) | – |
 
@@ -38,6 +44,18 @@ The minimum OS versions, the Linux distributions and the host versions are still
 - `Source/core/` – the analysis core, without JUCE and without allocation after `prepare`.
   `MonoScore.*`: the draft mono score formula of the specification, a 24 dB Linkwitz-Riley low-pass
   for the band score and a meter that publishes both scores every 400 ms.
+- `Source/core/Timeline.*` – recent audio of one source by timeline position, with run key and write
+  time per sample. `Source/core/ABAnalysis.*` – A/B correlation, offset search (normalised
+  cross-correlation, ±10 ms), polarity hint, sum score A+B below the cutoff.
+- `Source/transport/` – the link (no JUCE). `SharedRegion` is named shared memory (Windows file
+  mapping in `Local\`, POSIX `shm_open`), so it works across plugin binaries and processes. `Link.*`:
+  one slot per group (1–4) and source (A/B) with a lock-free ring of blocks stamped with the host
+  timeline position, run (epoch) and writer generation; the writer claims a slot by compare-and-swap,
+  a second writer is refused. The layout and its names (`pl1g1A` …) are versioned – change
+  `layoutVersion` when the layout changes.
+- `Source/shared/BusLink.*` – the Bus Analyzer's worker thread: polls slots A and B every 50 ms, joins
+  the newest 400 ms both cover from one continuous run each, decides the validity state and runs the
+  A/B analysis. Only `valid` shows A/B values.
 - `Source/shared/Parameters.*` – every host parameter. **The IDs are a contract with saved
   projects: never rename or remove one, only add.**
 - `Source/shared/AnalyzerProcessor.*` – the processor of both plugins (`Role::channel` or
@@ -48,9 +66,10 @@ The minimum OS versions, the Linux distributions and the host versions are still
   instrument view follows the UI preview of the specification.
 - `Source/channel/`, `Source/bus/` – the plugin entry points.
 
-For P0 the score is accumulated in the audio callback (a few multiplications per sample, no
-allocation, no locks). The link transport and the worker thread for the heavier analysis come with
-the P1 prototype.
+The audio callback only accumulates the mono score (a few multiplications per sample) and, in the
+Channel Analyzer, copies the block into the shared ring – no allocation, no locks, no system calls.
+Shared memory is opened on the message thread (timer, prepare, state load), never on the audio
+thread. The A/B analysis runs in the Bus Analyzer's worker thread.
 
 ## Releases
 

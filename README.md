@@ -6,11 +6,13 @@ possible cancellations, mono compatibility, striking resonances and the stereo i
 in plain words what to check. It only analyses – the audio passes through unchanged. VST3, CLAP and
 AU, built with JUCE.
 
-> **Status: P0 – groundwork, version 0.0.1.** Both plugins build, load and pass audio through
-> bit-identically (own tests, pluginval at strictness 10 on Windows). They already measure the mono
-> score (full band and below an adjustable cutoff) and have the mono monitor switch. Linking two
-> tracks to the Bus Analyzer, the spectrum, waveforms, goniometer, metering and history are not
-> built yet. Not tested in a DAW so far.
+> **Status: P1 – feasibility prototype, version 0.0.1.** Both plugins build, load and pass audio
+> through bit-identically (own tests, pluginval at strictness 10 on Windows). Channel Analyzers send
+> to the Bus Analyzer through shared memory – also across separate plugin processes – and the Bus
+> Analyzer joins A and B on the host timeline: correlation, time offset in samples with a hint,
+> polarity hint and how well A and B add up in the low end, plus the mono scores and the mono
+> monitor. The spectrum, waveforms, goniometer, metering and history are not built yet. Not tested in
+> a DAW so far ([host test](docs/Hosttest.md)).
 
 ## Planned features
 

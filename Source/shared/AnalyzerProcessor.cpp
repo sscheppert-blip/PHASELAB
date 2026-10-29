@@ -5,16 +5,47 @@
 namespace phaselab
 {
 
+namespace
+{
+    std::uint64_t makeToken()
+    {
+        // Identifies this instance as the writer of a slot; never stored in the project, so copies
+        // of an instance never share it.
+        return (std::uint64_t) juce::Random::getSystemRandom().nextInt64() | 1u;
+    }
+}
+
 AnalyzerProcessor::AnalyzerProcessor (Role r)
     : AudioProcessor (BusesProperties()
                           .withInput ("Input", juce::AudioChannelSet::stereo(), true)
                           .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
       role (r),
-      state (*this, nullptr, "PHASELAB", createParameterLayout (r))
+      state (*this, nullptr, "PHASELAB", createParameterLayout (r)),
+      writer (makeToken())
 {
     cutoff = state.getRawParameterValue (ids::bandCutoff);
+    group = state.getRawParameterValue (ids::group);
     if (role == Role::channel)
+    {
         mode = state.getRawParameterValue (ids::mode);
+        slot = state.getRawParameterValue (ids::slot);
+    }
+    else
+    {
+        busLink = std::make_unique<BusLink> (*group, *cutoff);
+    }
+
+    maintainLink();
+    startTimerHz (5);
+}
+
+AnalyzerProcessor::~AnalyzerProcessor()
+{
+    stopTimer();
+    if (busLink != nullptr)
+        busLink->stop();
+    if (sendingTo != nullptr)
+        writer.release (*sendingTo);
 }
 
 ChannelMode AnalyzerProcessor::getMode() const noexcept
@@ -24,11 +55,60 @@ ChannelMode AnalyzerProcessor::getMode() const noexcept
     return static_cast<ChannelMode> (juce::jlimit (0, 2, juce::roundToInt (mode->load())));
 }
 
+int AnalyzerProcessor::getGroup() const noexcept
+{
+    return juce::jlimit (0, link::maxGroups - 1, juce::roundToInt (group->load()));
+}
+
+int AnalyzerProcessor::getSlot() const noexcept
+{
+    return slot == nullptr ? 0 : juce::jlimit (0, 1, juce::roundToInt (slot->load()));
+}
+
+juce::String AnalyzerProcessor::getTrackName() const
+{
+    const juce::SpinLock::ScopedLockType lock (nameLock);
+    return trackName;
+}
+
+BusLinkStatus AnalyzerProcessor::getLinkStatus() const
+{
+    return busLink != nullptr ? busLink->getStatus() : BusLinkStatus {};
+}
+
+void AnalyzerProcessor::maintainLink()
+{
+    if (role != Role::channel || ! isSending())
+        return;
+
+    auto* layout = slots.acquire (getGroup(), getSlot());
+    if (layout != nullptr && layout->owner.load() == writer.getToken())
+        link::writeName (*layout, getTrackName().toStdString());
+}
+
+void AnalyzerProcessor::updateTrackProperties (const TrackProperties& properties)
+{
+    {
+        const juce::SpinLock::ScopedLockType lock (nameLock);
+        trackName = properties.name.value_or (juce::String());
+    }
+    maintainLink();
+}
+
 void AnalyzerProcessor::prepareToPlay (double sampleRate, int)
 {
     meter.setCutoff (cutoff->load());
     meter.prepare (sampleRate);
     wasAnalysing = isAnalysing();
+    maintainLink();
+    if (busLink != nullptr)
+        busLink->start();
+}
+
+void AnalyzerProcessor::releaseResources()
+{
+    if (busLink != nullptr)
+        busLink->stop();
 }
 
 bool AnalyzerProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
@@ -36,6 +116,51 @@ bool AnalyzerProcessor::isBusesLayoutSupported (const BusesLayout& layouts) cons
     const auto in = layouts.getMainInputChannelSet();
     const auto out = layouts.getMainOutputChannelSet();
     return in == out && (out == juce::AudioChannelSet::mono() || out == juce::AudioChannelSet::stereo());
+}
+
+link::BlockTiming AnalyzerProcessor::readTiming() const
+{
+    link::BlockTiming timing;
+    timing.sampleRate = getSampleRate();
+    timing.offline = isNonRealtime();
+
+    if (auto* head = getPlayHead())
+        if (const auto position = head->getPosition())
+            if (const auto samples = position->getTimeInSamples(); samples.hasValue() && position->getIsPlaying())
+            {
+                timing.hostTime = true;
+                timing.timeline = *samples;
+            }
+
+    return timing;
+}
+
+void AnalyzerProcessor::sendBlock (const float* left, const float* right, int numSamples)
+{
+    if (! isSending())
+    {
+        if (sendingTo != nullptr)
+            writer.release (*sendingTo);
+        sendingTo = nullptr;
+        sendState.store (SendState::off);
+        return;
+    }
+
+    auto* target = slots.lookup (getGroup(), getSlot());
+    if (sendingTo != nullptr && sendingTo != target)
+    {
+        writer.release (*sendingTo);   // group or slot changed: free the old slot at once
+        sendingTo = nullptr;
+    }
+    if (target == nullptr)
+    {
+        sendState.store (SendState::unavailable);   // the timer opens it shortly
+        return;
+    }
+
+    const auto result = writer.write (*target, left, right, numSamples, readTiming(), link::nowMs());
+    sendingTo = result == link::WriteStatus::sent ? target : nullptr;
+    sendState.store (result == link::WriteStatus::sent ? SendState::sending : SendState::busy);
 }
 
 void AnalyzerProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer&)
@@ -50,7 +175,7 @@ void AnalyzerProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mi
     const float* left = buffer.getReadPointer (0);
     const float* right = buffer.getReadPointer (channels > 1 ? 1 : 0);
 
-    // Analysis always reads the unchanged input, before the mono monitor (D-30).
+    // Analysis and link always read the unchanged input, before the mono monitor (D-30).
     const bool analysing = isAnalysing();
     if (analysing)
     {
@@ -60,6 +185,9 @@ void AnalyzerProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mi
         meter.process (left, right, numSamples);
     }
     wasAnalysing = analysing;
+
+    if (role == Role::channel)
+        sendBlock (left, right, numSamples);
 
     float peak = 0.0f;
     for (int ch = 0; ch < channels; ++ch)
@@ -105,6 +233,7 @@ void AnalyzerProcessor::setStateInformation (const void* data, int sizeInBytes)
 
     // Loading a project never brings back the mono monitor, so no export turns mono by accident.
     monoMonitor.store (false);
+    maintainLink();
 }
 
 } // namespace phaselab

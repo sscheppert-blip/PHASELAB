@@ -26,13 +26,20 @@ FetchContent_Declare(clap_juce_extensions
 FetchContent_MakeAvailable(JUCE clap_juce_extensions)
 
 # ---------------------------------------------------------------------------
-# Analysis core (no JUCE): shared by both plugins and the tests
+# Analysis core and link transport (no JUCE): shared by both plugins and the tests
 # ---------------------------------------------------------------------------
 add_library(PhaseLabCore STATIC
-    Source/core/MonoScore.cpp)
+    Source/core/MonoScore.cpp
+    Source/core/Timeline.cpp
+    Source/core/ABAnalysis.cpp
+    Source/transport/SharedRegion.cpp
+    Source/transport/Link.cpp)
 target_include_directories(PhaseLabCore PUBLIC Source)
 target_compile_features(PhaseLabCore PUBLIC cxx_std_20)
 set_target_properties(PhaseLabCore PROPERTIES POSITION_INDEPENDENT_CODE ON)
+if(UNIX AND NOT APPLE)
+    target_link_libraries(PhaseLabCore PUBLIC rt)   # shm_open on older glibc
+endif()
 if(MSVC)
     target_compile_options(PhaseLabCore PRIVATE /W4)
 else()
@@ -43,7 +50,8 @@ endif()
 set(PHASELAB_SHARED_SOURCES
     Source/shared/Parameters.cpp
     Source/shared/AnalyzerProcessor.cpp
-    Source/shared/AnalyzerEditor.cpp)
+    Source/shared/AnalyzerEditor.cpp
+    Source/shared/BusLink.cpp)
 
 set(PHASELAB_PLUGIN_DEFINITIONS
     JUCE_WEB_BROWSER=0

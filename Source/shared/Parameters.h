@@ -16,6 +16,7 @@ namespace ids
     inline constexpr const char* bandCutoff = "band_cutoff";
     inline constexpr const char* mode = "mode";
     inline constexpr const char* slot = "slot";
+    inline constexpr const char* group = "group";
 }
 
 juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout (Role role);
