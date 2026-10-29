@@ -505,11 +505,15 @@ void testLinkStates()
 }
 
 // Child process: sends source B with a known delay, paced like a realtime host.
+// A group no other test uses: POSIX shared memory outlives its users, so an earlier test's blocks
+// would still be in the slots of group 1.
+constexpr int crossProcessGroup = 3;
+
 int runLinkChild (const juce::String& prefix, int seconds, int delay)
 {
     link::setNamespace (prefix.toStdString());
     link::SlotTable table;
-    auto* slot = table.acquire (0, 1);
+    auto* slot = table.acquire (crossProcessGroup, 1);
     if (slot == nullptr)
         return 2;
     link::Writer writer ((std::uint64_t) juce::Random::getSystemRandom().nextInt64() | 1u);
@@ -537,14 +541,16 @@ void testLinkAcrossProcesses (const juce::String& prefix)
 {
     // B comes from a separate process (sandboxed hosts, O-04), A from this one, both on the same timeline.
     constexpr int delay = 7;
+    link::SlotTable table;
+    auto* slotA = table.acquire (crossProcessGroup, 0);
+    auto* slotB = table.acquire (crossProcessGroup, 1);
+    const std::uint32_t generationBefore = slotB != nullptr ? slotB->generation.load() : 0;
+
     juce::ChildProcess child;
     const auto exe = juce::File::getSpecialLocation (juce::File::currentExecutableFile).getFullPathName();
     const bool started = child.start (juce::StringArray { exe, "--link-child", prefix, "3", juce::String (delay) }, 0);
 
-    link::SlotTable table;
-    auto* slotA = table.acquire (0, 0);
-    auto* slotB = table.acquire (0, 1);
-    std::atomic<float> groupValue { 0.0f }, cutoffValue { 120.0f };
+    std::atomic<float> groupValue { (float) crossProcessGroup }, cutoffValue { 120.0f };
     BusLink bus (groupValue, cutoffValue);
     link::Writer writer (41);
     std::vector<float> block (256);
@@ -555,12 +561,13 @@ void testLinkAcrossProcesses (const juce::String& prefix)
     const auto until = juce::Time::getMillisecondCounter() + 5000;
     while (started && slotA != nullptr && slotB != nullptr && juce::Time::getMillisecondCounter() < until)
     {
-        // Follow B like a host would process both tracks in the same cycle.
+        // Follow B like a host would process both tracks in the same cycle – only blocks of the child.
+        const std::uint32_t generation = slotB->generation.load();
         const std::uint64_t records = slotB->recordsWritten.load();
-        if (records > 0)
+        const auto& last = slotB->records[(records - 1) % link::recordCount];
+        if (records > 0 && generation != generationBefore && last.generation.load() == generation)
         {
             otherProcess = true;
-            const auto& last = slotB->records[(records - 1) % link::recordCount];
             const std::int64_t end = last.timeline.load() + (std::int64_t) last.length.load();
             for (; position + 256 <= end; position += 256)
             {
