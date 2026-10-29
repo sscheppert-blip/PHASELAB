@@ -1,0 +1,90 @@
+# ── Build output ────────────────────────────────────────────
+/build/
+/build-*/
+/out/
+/cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+CMakeUserPresets.json
+compile_commands.json
+
+# Fetched dependencies (JUCE, CLAP, … are pulled by CMake)
+/_deps/
+/libs/
+/.cache/
+
+# Built plugins
+*.vst3/
+*.vst3
+*.clap
+*.component/
+*.component
+*.app/
+*.dll
+*.so
+*.dylib
+*.a
+*.lib
+*.exp
+*.pdb
+*.o
+*.obj
+
+# ── Secrets — never commit ──────────────────────────────────
+.env
+.env.*
+*.p12
+*.pfx
+*.pem
+*.key
+*.cer
+*.crt
+*.mobileprovision
+*.provisionprofile
+*.keychain
+*.keychain-db
+secrets/
+credentials*
+*token*
+notarize*.json
+
+# ── OS / editor ─────────────────────────────────────────────
+.DS_Store
+._*
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.swp
+*~
+*.xcuserstate
+xcuserdata/
+*.xcworkspace/xcuserdata/
+DerivedData/
+.vs/
+*.user
+*.suo
+
+# ── Logs, dumps, test audio ─────────────────────────────────
+*.log
+*.dmp
+*.crash
+# core dumps in the repository root only (Source/core/ is code)
+/core
+/core.[0-9]*
+/test-output/
+/renders/
+*.wav
+*.aif
+*.aiff
+*.flac
+*.mp3
+
+# ── Agent notes (stay local, kept in the owner's cloud) ─────
+CLAUDE.md
+CLAUDE.local.md
+AGENTS.md
+.claude/
+
+# Specification handoff (chapters, CSV templates, manual, UI preview): kept locally, not published
+/docs/spec/

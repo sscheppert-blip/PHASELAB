@@ -1,0 +1,178 @@
+name: build
+
+# Builds run only on demand, to save Actions minutes (macOS counts 10x, Windows 2x).
+# The version must match VERSION in CMakeLists.txt.
+#
+#   On a Mac:  tools/release-mac.sh 0.1.0
+#              builds the macOS packages locally (free), creates a draft release with them and
+#              starts this workflow with macos=false; it adds Linux + Windows and publishes.
+#   On a PC:   gh workflow run build -f version=0.1.0
+#              (or Actions → build → Run workflow): builds all three platforms here.
+#
+# Each run builds and tests both plugins (Channel Analyzer, Bus Analyzer) as AU (macOS), VST3 and
+# CLAP and publishes release v<version>.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, must match VERSION in CMakeLists.txt (creates tag v<version>)"
+        required: true
+        type: string
+      macos:
+        description: "Build macOS here (off when the macOS packages were built locally)"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  # Cheap checks first (one Linux minute), so a bad version or a leak never starts the expensive builds.
+  scan:
+    name: Check version and scan for sensitive data
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "version must look like 0.1.0" >&2; exit 1; }
+          grep -Eq "^project\(PhaseLab VERSION ${VERSION//./\\.} " CMakeLists.txt \
+            || { echo "version $VERSION does not match VERSION in CMakeLists.txt" >&2; exit 1; }
+
+      - name: Scan for credentials and local-machine data
+        run: |
+          sudo apt-get install -y ripgrep
+          ./tools/check-sensitive-data.sh
+
+      - name: Choose platforms
+        id: matrix
+        env:
+          MACOS: ${{ inputs.macos }}
+        run: |
+          tests=build/PhaseLabTests_artefacts/Release/PhaseLabTests
+          plugins="PhaseLabChannel_VST3 PhaseLabChannel_CLAP PhaseLabBus_VST3 PhaseLabBus_CLAP PhaseLabTests"
+          entries=$(jq -nc --arg t "$tests" --arg p "$plugins" '[
+            { name: "macOS",   os: "macos-latest",
+              configure: "-G Ninja -DCMAKE_BUILD_TYPE=Release \"-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64\"",
+              targets: ("PhaseLabChannel_AU PhaseLabBus_AU " + $p), tests: $t },
+            { name: "Linux",   os: "ubuntu-24.04",
+              configure: "-G Ninja -DCMAKE_BUILD_TYPE=Release",
+              targets: $p, tests: ("xvfb-run -a " + $t) },
+            { name: "Windows", os: "windows-latest",
+              configure: "-A x64",
+              targets: $p, tests: ($t + ".exe") }
+          ]')
+          if [[ "$MACOS" != "true" ]]; then
+            entries=$(jq -c 'map(select(.name != "macOS"))' <<< "$entries")
+          fi
+          echo "matrix={\"include\":$entries}" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: ${{ matrix.name }}
+    needs: scan
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix: ${{ fromJSON(needs.scan.outputs.matrix) }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libasound2-dev libjack-jackd2-dev \
+            libfreetype-dev libfontconfig1-dev libx11-dev libxcomposite-dev libxcursor-dev \
+            libxext-dev libxinerama-dev libxrandr-dev libxrender-dev libxi-dev \
+            libglu1-mesa-dev libegl-dev xvfb   # xvfb: the tests open the editor
+
+      - name: Install Ninja (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ninja
+
+      - name: Configure
+        run: cmake -S . -B build ${{ matrix.configure }} -DPHASELAB_COPY_PLUGIN=OFF
+
+      - name: Build
+        run: cmake --build build --config Release --parallel --target ${{ matrix.targets }}
+
+      - name: Test
+        shell: bash
+        run: ${{ matrix.tests }}
+
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p dist
+          for plugin in "PhaseLabChannel|PhaseLab Channel Analyzer" "PhaseLabBus|PhaseLab Bus Analyzer"; do
+            IFS='|' read -r target name <<< "$plugin"
+            file="${name// /-}"
+            cd "$GITHUB_WORKSPACE/build/${target}_artefacts/Release"
+            case "${{ runner.os }}" in
+              macOS)
+                ditto -c -k --keepParent "AU/$name.component" "$GITHUB_WORKSPACE/dist/$file-macOS-AU.zip"
+                ditto -c -k --keepParent "VST3/$name.vst3" "$GITHUB_WORKSPACE/dist/$file-macOS-VST3.zip"
+                ditto -c -k --keepParent "CLAP/$name.clap" "$GITHUB_WORKSPACE/dist/$file-macOS-CLAP.zip" ;;
+              Linux)
+                tar -czf "$GITHUB_WORKSPACE/dist/$file-Linux-VST3.tar.gz" -C VST3 "$name.vst3"
+                tar -czf "$GITHUB_WORKSPACE/dist/$file-Linux-CLAP.tar.gz" -C CLAP "$name.clap" ;;
+              Windows)
+                7z a "$GITHUB_WORKSPACE/dist/$file-Windows-VST3.zip" "./VST3/$name.vst3"
+                7z a "$GITHUB_WORKSPACE/dist/$file-Windows-CLAP.zip" "./CLAP/$name.clap" ;;
+            esac
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PhaseLab-${{ matrix.name }}
+          path: dist/*
+          retention-days: 7
+
+  release:
+    name: Release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: PhaseLab-*
+          path: release
+          merge-multiple: true
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          MACOS: ${{ inputs.macos }}
+        run: |
+          ls -l release
+          tag="v$VERSION"
+          if draft=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft,targetCommitish 2>/dev/null); then
+            # Draft from tools/release-mac.sh, already holding the macOS packages.
+            [[ "$(jq -r .isDraft <<< "$draft")" == "true" ]] || { echo "release $tag is already published" >&2; exit 1; }
+            target=$(jq -r .targetCommitish <<< "$draft")
+            [[ "$target" == "$GITHUB_SHA" ]] || { echo "draft $tag targets $target, this build is $GITHUB_SHA" >&2; exit 1; }
+            gh release upload "$tag" release/* --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          else
+            [[ "$MACOS" == "true" ]] || { echo "no macOS packages: run tools/release-mac.sh, or start with macos=true" >&2; exit 1; }
+            gh release create "$tag" release/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "PhaseLab $VERSION" \
+              --generate-notes
+          fi
