@@ -35,9 +35,9 @@ sha=$(git rev-parse HEAD)
 build=build-release
 dist=$build/dist
 
-# ── build + test (universal binary) ─────────────────────────────────────────
+# ── build + test (Apple Silicon only, D-01) ─────────────────────────────────
 echo "▸ building macOS packages for $tag ($sha)"
-cmake -S . -B "$build" -G Ninja -DCMAKE_BUILD_TYPE=Release "-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64" -DPHASELAB_COPY_PLUGIN=OFF >/dev/null
+cmake -S . -B "$build" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=arm64 -DPHASELAB_COPY_PLUGIN=OFF >/dev/null
 cmake --build "$build" --target PhaseLabChannel_AU PhaseLabChannel_VST3 PhaseLabChannel_CLAP \
                                  PhaseLabBus_AU PhaseLabBus_VST3 PhaseLabBus_CLAP PhaseLabTests
 "$build/PhaseLabTests_artefacts/Release/PhaseLabTests"
@@ -54,7 +54,7 @@ for plugin in "PhaseLabChannel|PhaseLab Channel Analyzer|PlCh" "PhaseLabBus|Phas
     for bundle in "VST3/$name.vst3" "CLAP/$name.clap" "AU/$name.component"; do
         codesign -v "$release/$bundle"
         archs="$(lipo -archs "$release/$bundle/Contents/MacOS/$name")"
-        [[ "$archs" == *arm64* && "$archs" == *x86_64* ]] || die "$bundle is not universal"
+        [[ "$archs" == *arm64* ]] || die "$bundle is not built for Apple Silicon"
     done
 
     # auval needs the component installed; this replaces any installed copy.

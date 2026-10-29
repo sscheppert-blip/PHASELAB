@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/ABAnalysis.h"
+#include "core/Spectrum.h"
 #include "transport/Link.h"
 
 #include <juce_core/juce_core.h>
@@ -38,6 +39,11 @@ struct BusLinkStatus
     double sampleRate = 0.0;
     ABResult result;   // only meaningful while state == valid
     int group = 0;
+
+    // Display data of A and B (only while an editor is open, D-29)
+    SpectrumResult spectrum;                  // x = A, y = B
+    std::array<float, 4096> waveA {}, waveB {};
+    int waveLength = 0;                       // newest 40 ms of the joined window
 };
 
 // Bus Analyzer side of the link: a worker thread follows slots A and B of the selected group,
@@ -58,6 +64,8 @@ public:
     void step (std::int64_t now);
 
     BusLinkStatus getStatus() const;
+    void getStatus (BusLinkStatus& out) const;
+    void setDisplayActive (bool active) noexcept { displayUsers.fetch_add (active ? 1 : -1); }
 
 private:
     void run() override;
@@ -74,9 +82,16 @@ private:
     std::int64_t lastAnalysedEnd = 0;
     float lastCutoff = 0.0f;
     ABResult lastResult;
+    std::atomic<int> displayUsers { 0 };
+    SpectrumAnalyzer spectrum;
+    SpectrumResult lastSpectrum;
+    std::vector<float> lastWaveA, lastWaveB;
+    int lastWaveLength = 0;
 
+    // Large: kept on the heap so a processor stays small.
+    std::unique_ptr<BusLinkStatus> work;
     mutable juce::SpinLock statusLock;
-    BusLinkStatus status;
+    std::unique_ptr<BusLinkStatus> status;
 };
 
 } // namespace phaselab

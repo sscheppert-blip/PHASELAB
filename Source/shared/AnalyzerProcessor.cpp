@@ -35,13 +35,34 @@ AnalyzerProcessor::AnalyzerProcessor (Role r)
         busLink = std::make_unique<BusLink> (*group, *cutoff);
     }
 
+    if (! state.state.hasProperty ("language"))
+        state.state.setProperty ("language", juce::SystemStats::getUserLanguage().startsWithIgnoreCase ("de") ? "de" : "en", nullptr);
+
     maintainLink();
     startTimerHz (5);
+}
+
+void AnalyzerProcessor::setDisplayActive (bool active) noexcept
+{
+    engine.setDisplayActive (active);
+    if (busLink != nullptr)
+        busLink->setDisplayActive (active);
+}
+
+bool AnalyzerProcessor::isEnglish() const
+{
+    return state.state.getProperty ("language").toString() == "en";
+}
+
+void AnalyzerProcessor::setEnglish (bool english)
+{
+    state.state.setProperty ("language", english ? "en" : "de", nullptr);
 }
 
 AnalyzerProcessor::~AnalyzerProcessor()
 {
     stopTimer();
+    engine.stop();
     if (busLink != nullptr)
         busLink->stop();
     if (sendingTo != nullptr)
@@ -100,6 +121,8 @@ void AnalyzerProcessor::prepareToPlay (double sampleRate, int)
     meter.setCutoff (cutoff->load());
     meter.prepare (sampleRate);
     wasAnalysing = isAnalysing();
+    engine.prepare (sampleRate);
+    engine.start();
     maintainLink();
     if (busLink != nullptr)
         busLink->start();
@@ -107,6 +130,7 @@ void AnalyzerProcessor::prepareToPlay (double sampleRate, int)
 
 void AnalyzerProcessor::releaseResources()
 {
+    engine.stop();
     if (busLink != nullptr)
         busLink->stop();
 }
@@ -183,6 +207,24 @@ void AnalyzerProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mi
             meter.reset();   // values from before "Nur Senden" are stale
         meter.setCutoff (cutoff->load());
         meter.process (left, right, numSamples);
+
+        BlockInfo info;
+        if (auto* head = getPlayHead())
+            if (const auto position = head->getPosition())
+            {
+                info.playing = position->getIsPlaying();
+                if (const auto ppq = position->getPpqPosition())
+                {
+                    info.hasMusicalPosition = true;
+                    info.ppq = *ppq;
+                }
+                if (const auto sig = position->getTimeSignature())
+                {
+                    info.numerator = sig->numerator;
+                    info.denominator = sig->denominator;
+                }
+            }
+        engine.push (left, right, numSamples, info);
     }
     wasAnalysing = analysing;
 

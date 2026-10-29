@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22)
 
-project(PhaseLab VERSION 0.0.1 LANGUAGES C CXX)
+project(PhaseLab VERSION 0.1.0 LANGUAGES C CXX)
 
 option(PHASELAB_BUILD_TESTS "Build the offline tests" ON)
 option(PHASELAB_COPY_PLUGIN "Copy the built plugins into the user's plugin folders" ON)
@@ -8,6 +8,11 @@ option(PHASELAB_COPY_PLUGIN "Copy the built plugins into the user's plugin folde
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "Minimum macOS version")
+
+# German UI texts are written as UTF-8 in the sources.
+if(MSVC)
+    add_compile_options(/utf-8)
+endif()
 
 # Dependencies are fetched into the build tree, never committed (inventory: docs/Dependencies.md).
 include(FetchContent)
@@ -32,6 +37,10 @@ add_library(PhaseLabCore STATIC
     Source/core/MonoScore.cpp
     Source/core/Timeline.cpp
     Source/core/ABAnalysis.cpp
+    Source/core/FFT.cpp
+    Source/core/Loudness.cpp
+    Source/core/Spectrum.cpp
+    Source/core/Stereo.cpp
     Source/transport/SharedRegion.cpp
     Source/transport/Link.cpp)
 target_include_directories(PhaseLabCore PUBLIC Source)
@@ -51,7 +60,11 @@ set(PHASELAB_SHARED_SOURCES
     Source/shared/Parameters.cpp
     Source/shared/AnalyzerProcessor.cpp
     Source/shared/AnalyzerEditor.cpp
-    Source/shared/BusLink.cpp)
+    Source/shared/BusLink.cpp
+    Source/shared/AnalysisEngine.cpp
+    Source/ui/Look.cpp
+    Source/ui/Advice.cpp
+    Source/ui/Panel.cpp)
 
 set(PHASELAB_PLUGIN_DEFINITIONS
     JUCE_WEB_BROWSER=0

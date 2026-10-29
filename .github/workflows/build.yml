@@ -9,7 +9,7 @@ name: build
 #   On a PC:   gh workflow run build -f version=0.1.0
 #              (or Actions → build → Run workflow): builds all three platforms here.
 #
-# Each run builds and tests both plugins (Channel Analyzer, Bus Analyzer) as AU (macOS), VST3 and
+# Each run builds and tests both plugins (Channel Analyzer, Bus Analyzer) as AU (macOS, Apple Silicon), VST3 and
 # CLAP and publishes release v<version>.
 on:
   workflow_dispatch:
@@ -63,7 +63,7 @@ jobs:
           plugins="PhaseLabChannel_VST3 PhaseLabChannel_CLAP PhaseLabBus_VST3 PhaseLabBus_CLAP PhaseLabTests"
           entries=$(jq -nc --arg t "$tests" --arg p "$plugins" '[
             { name: "macOS",   os: "macos-latest",
-              configure: "-G Ninja -DCMAKE_BUILD_TYPE=Release \"-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64\"",
+              configure: "-G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=arm64",
               targets: ("PhaseLabChannel_AU PhaseLabBus_AU " + $p), tests: $t },
             { name: "Linux",   os: "ubuntu-24.04",
               configure: "-G Ninja -DCMAKE_BUILD_TYPE=Release",

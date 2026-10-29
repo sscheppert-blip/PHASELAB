@@ -1,13 +1,18 @@
 // Offline tests for the analysis core, the shared processor and the link (P1 harness).
 //   PhaseLabTests                               run all tests
-//   PhaseLabTests --snapshot <png> channel|bus [send|mono|linked]
+//   PhaseLabTests --snapshot <png> channel|bus [send|mono|linked|en, combinable: linked-en]
 //                                               render the panel after feeding a test signal
 //   PhaseLabTests --link-child <prefix> <seconds> <delay>
 //                                               internal: second process sending source B
 
 #include "core/MonoScore.h"
 #include "shared/AnalyzerProcessor.h"
+#include "core/Loudness.h"
+#include "core/Spectrum.h"
+#include "core/Stereo.h"
+#include "shared/AnalyzerEditor.h"
 #include "transport/Link.h"
+#include "ui/Advice.h"
 
 #include <juce_audio_utils/juce_audio_utils.h>
 
@@ -250,7 +255,11 @@ public:
     {
         PositionInfo info;
         if (hasTime)
+        {
             info.setTimeInSamples (timeline);
+            info.setPpqPosition ((double) timeline / (rate / 2.0));   // 120 BPM
+            info.setTimeSignature (TimeSignature { 4, 4 });
+        }
         info.setIsPlaying (playing);
         return info;
     }
@@ -580,51 +589,308 @@ void testLinkAcrossProcesses (const juce::String& prefix)
 }
 
 //==============================================================================
+// Measurement core (P2): references from BS.1770 / EBU 3341 / 3342 and synthetic cases
+//==============================================================================
+
+using StereoSignal = std::function<void (int, float&, float&)>;
+
+void runLevels (LevelMeter& m, const StereoSignal& s, int length)
+{
+    std::vector<float> l (1024), r (1024);
+    for (int pos = 0; pos < length; pos += 1024)
+    {
+        const int n = std::min (1024, length - pos);
+        for (int i = 0; i < n; ++i)
+            s (pos + i, l[(size_t) i], r[(size_t) i]);
+        m.process (l.data(), r.data(), n);
+    }
+}
+
+SpectrumResult spectrumOf (const StereoSignal& s, int frames = 24)
+{
+    SpectrumAnalyzer a;
+    a.prepare (rate);
+    std::vector<float> l ((size_t) spectrumSize), r ((size_t) spectrumSize);
+    for (int f = 0; f < frames; ++f)
+    {
+        for (int i = 0; i < spectrumSize; ++i)
+            s (f * spectrumSize / 4 + i, l[(size_t) i], r[(size_t) i]);
+        a.addFrame (l.data(), r.data(), -1.0);
+    }
+    return a.result();
+}
+
+int bandOf (double hz)
+{
+    int best = 0;
+    for (int b = 0; b < bandCount; ++b)
+        if (std::abs (std::log (bandCentre (b) / hz)) < std::abs (std::log (bandCentre (best) / hz)))
+            best = b;
+    return best;
+}
+
+void testLoudness()
+{
+    const float a23 = (float) std::pow (10.0, -23.0 / 20.0);
+    {
+        LevelMeter m;
+        m.prepare (rate);
+        runLevels (m, [a23] (int i, float& l, float& r) { l = r = a23 * sine (1000, i); }, 20 * 48000);
+        const auto v = m.values();
+        check (std::abs (v.integrated + 23.0) < 0.1 && std::abs (v.momentary + 23.0) < 0.1 && std::abs (v.shortTerm + 23.0) < 0.1,
+               "loudness: 1 kHz at -23 dBFS stereo reads -23.0 LUFS (EBU 3341 case 1)");
+    }
+    {
+        LevelMeter m;
+        m.prepare (44100.0);
+        const float a33 = (float) std::pow (10.0, -33.0 / 20.0);
+        std::vector<float> l (1024), r (1024);
+        for (int pos = 0; pos < 20 * 44100; pos += 1024)
+        {
+            for (int i = 0; i < 1024; ++i)
+                l[(size_t) i] = r[(size_t) i] = a33 * (float) std::sin (2.0 * pi * 1000.0 * (pos + i) / 44100.0);
+            m.process (l.data(), r.data(), 1024);
+        }
+        check (std::abs (m.values().integrated + 33.0) < 0.1, "loudness: -33 dBFS at 44.1 kHz reads -33.0 LUFS (EBU 3341 case 2)");
+    }
+    {
+        LevelMeter m;
+        m.prepare (rate);
+        const float a20 = (float) std::pow (10.0, -20.0 / 20.0), a30 = (float) std::pow (10.0, -30.0 / 20.0);
+        runLevels (m, [a20, a30] (int i, float& l, float& r) { l = r = (i < 20 * 48000 ? a20 : a30) * sine (1000, i); }, 40 * 48000);
+        check (std::abs (m.values().range - 10.0) < 1.0, "loudness: 20 s at -20 then -30 dBFS gives LRA 10 LU (EBU 3342 case 1)");
+    }
+    {
+        LevelMeter m;
+        m.prepare (rate);
+        // fs/4 with a 45° phase: every sample is at ±0.707, the waveform between them reaches 1.0.
+        runLevels (m, [] (int i, float& l, float& r) { l = r = (float) std::sin (pi / 2.0 * i + pi / 4.0); }, 48000);
+        const auto v = m.values();
+        check (std::abs (v.peak + 3.01) < 0.05 && std::abs (v.truePeak) < 0.5, "true peak finds the inter-sample peak (sample -3 dB, true ~0 dBTP)");
+    }
+    {
+        LevelMeter m;
+        m.prepare (rate);
+        runLevels (m, [] (int i, float& l, float& r) { l = r = 0.5f * sine (1000, i); }, 48000);
+        const auto v = m.values();
+        check (std::abs (v.rms + 9.03) < 0.1 && std::abs (v.peak + 6.02) < 0.05, "peak and RMS of a sine at amplitude 0.5 (-6.0 / -9.0 dBFS)");
+    }
+    {
+        LevelMeter m;
+        m.prepare (rate);
+        check (m.values().integrated <= noLevel && m.values().peak <= noLevel, "loudness: no value before any audio");
+    }
+}
+
+void testSpectrum()
+{
+    {
+        const auto s = spectrumOf ([] (int i, float& l, float& r) { l = r = 0.5f * sine (1000, i); });
+        int nearest = 0;
+        for (int p = 0; p < displayPoints; ++p)
+            if (std::abs (displayFrequency (p) - 1000.0) < std::abs (displayFrequency (nearest) - 1000.0))
+                nearest = p;
+        float top = -200.0f;
+        for (int p = nearest - 2; p <= nearest + 2; ++p)
+            top = std::max (top, s.mid[(size_t) p]);
+        check (std::abs (top + 6.02f) < 1.0f, "spectrum: a sine of amplitude 0.5 shows at about -6 dB");
+    }
+    {
+        std::mt19937 rng (3);
+        std::normal_distribution<float> noise (0.0f, 0.02f);
+        const auto s = spectrumOf ([&] (int i, float& l, float& r) { l = r = noise (rng) + 0.3f * sine (2400, i); });
+        check (s.resonanceHz > 2350.0 && s.resonanceHz < 2450.0 && s.resonanceDb >= 6.0, "resonance: a narrow peak at 2.4 kHz is found");
+    }
+    {
+        const auto same = spectrumOf ([] (int i, float& l, float& r) { l = r = noiseAt (i); });
+        const auto inverted = spectrumOf ([] (int i, float& l, float& r) { l = noiseAt (i); r = -l; });
+        const auto wide = spectrumOf ([] (int i, float& l, float& r) { l = noiseAt (i); r = noiseAt (i + 7777777); });
+        bool sameOk = true, invertedOk = true;
+        double wideAbs = 0.0;
+        int n = 0;
+        for (int b = 3; b < bandCount - 2; ++b)
+        {
+            sameOk = sameOk && same.correlation[(size_t) b] > 0.99 && same.monoLoss[(size_t) b] > -0.1;
+            invertedOk = invertedOk && inverted.correlation[(size_t) b] < -0.99 && inverted.monoLoss[(size_t) b] < -30.0;
+            wideAbs += std::abs (wide.correlation[(size_t) b]);
+            ++n;
+        }
+        check (sameOk, "bands: identical channels correlate +1 with no mono loss");
+        check (invertedOk, "bands: opposite polarity correlates -1 and loses everything in mono");
+        check (wideAbs / n < 0.3, "bands: unrelated channels show low correlation");
+    }
+    {
+        // B one sample later: phase of B at 1 kHz is -360° · 1000 / 48000 = -7.5°.
+        const auto s = spectrumOf ([] (int i, float& l, float& r) { l = noiseAt (i); r = noiseAt (i - 1); });
+        check (std::abs (s.phase[(size_t) bandOf (1000.0)] + 7.5) < 2.0, "bands: one sample delay gives -7.5° phase at 1 kHz");
+    }
+}
+
+void testStereoAndHistory()
+{
+    auto stereoOf = [] (const StereoSignal& s)
+    {
+        StereoMeter m;
+        m.prepare (rate);
+        std::vector<float> l (48000), r (48000);
+        for (int i = 0; i < 48000; ++i)
+            s (i, l[(size_t) i], r[(size_t) i]);
+        m.process (l.data(), r.data(), 48000);
+        return m.values();
+    };
+    const auto mono = stereoOf ([] (int i, float& l, float& r) { l = r = noiseAt (i); });
+    const auto inverted = stereoOf ([] (int i, float& l, float& r) { l = noiseAt (i); r = -l; });
+    const auto left = stereoOf ([] (int i, float& l, float& r) { l = noiseAt (i); r = 0.0f; });
+    check (mono.correlation > 0.99 && mono.sidePercent < 0.1 && std::abs (mono.balanceDb) < 0.1, "stereo: mono signal → correlation +1, no side, centre");
+    check (inverted.correlation < -0.99 && inverted.sidePercent > 99.9, "stereo: opposite polarity → correlation -1, all side");
+    check (left.balanceDb < -20.0, "stereo: left only → balance far left");
+
+    // Engine: history points every 100 ms with the bar position, overflow and display gating.
+    MonoScoreMeter meter;
+    AnalysisEngine engine (meter);
+    engine.prepare (rate);
+    std::vector<float> l (480), r (480);
+    for (int block = 0; block < 100; ++block)   // 1 s
+    {
+        for (int i = 0; i < 480; ++i)
+            l[(size_t) i] = r[(size_t) i] = noiseAt (block * 480 + i);
+        BlockInfo info;
+        info.playing = true;
+        info.hasMusicalPosition = true;
+        info.ppq = (block * 480.0) / 24000.0;   // 120 BPM
+        engine.push (l.data(), r.data(), 480, info);
+        if (block % 10 == 9)
+            engine.processPending();
+    }
+    auto snapshot = std::make_unique<EngineSnapshot>();
+    engine.copySnapshot (*snapshot);
+    const auto& last = snapshot->history[(size_t) History::points - 1];
+    check (last.valid && last.value > 0.99f && last.bar > 1.4 && last.bar < 1.6, "history: points every 100 ms carry correlation and bar position (bar 1.5 after 1 s)");
+    check (! snapshot->spectrum.valid && snapshot->waveLength == 0, "display analysis stays off while no editor is open (D-29)");
+
+    engine.setDisplayActive (true);
+    for (int block = 0; block < 40; ++block)
+    {
+        for (int i = 0; i < 480; ++i)
+            l[(size_t) i] = r[(size_t) i] = noiseAt (block * 480 + i);
+        engine.push (l.data(), r.data(), 480, {});
+    }
+    engine.processPending();
+    engine.copySnapshot (*snapshot);
+    check (snapshot->spectrum.valid && snapshot->waveLength > 0, "display analysis runs while an editor is open");
+
+    for (int block = 0; block < 400; ++block)   // 4 s without the worker: more than the FIFO holds
+        engine.push (l.data(), r.data(), 480, {});
+    engine.processPending();
+    engine.copySnapshot (*snapshot);
+    check (snapshot->overflow, "a worker that falls behind marks the gap instead of blocking the audio thread");
+    engine.setDisplayActive (false);
+}
+
+void testAdviceAndPanel()
+{
+    auto snapshot = std::make_unique<EngineSnapshot>();
+    snapshot->stereo.valid = true;
+    snapshot->stereo.correlation = 0.6;
+    const ui::OwnInput wideBass { *snapshot, 80, 40, 120.0 };
+    const auto de = ui::adviseOwnInput (wideBass, false), en = ui::adviseOwnInput (wideBass, true);
+    check (de.warning && de.title.contains ("monotauglich") && en.title.contains ("mono-safe"),
+           "advice: a wide low end is named, in German and English");
+
+    snapshot->levels.truePeak = -0.3;
+    check (ui::adviseOwnInput (wideBass, false).title.contains ("True Peak"), "advice: true peak above -1 dBTP comes first");
+
+    BusLinkStatus link;
+    link.state = LinkState::valid;
+    link.sampleRate = rate;
+    link.result.enoughSignal = link.result.clearOffset = true;
+    link.result.offsetSamples = 20;
+    link.result.offsetCorrelation = 0.97;
+    snapshot->levels.truePeak = -6.0;
+    const auto bus = ui::adviseBus ({ *snapshot, 80, 90, 120.0 }, link, false);
+    check (bus.text.contains ("20 Samples") && bus.text.contains ("vorziehen"), "advice: the bus names the offset and what to do");
+
+    // Every panel state paints without trouble, in both languages.
+    bool painted = true;
+    for (auto role : { Role::channel, Role::bus })
+        for (bool english : { false, true })
+            for (int mode : { 0, 2 })
+            {
+                AnalyzerProcessor p (role);
+                p.setPlayConfigDetails (2, 2, rate, 256);
+                p.setEnglish (english);
+                if (role == Role::channel)
+                    setParameter (p, ids::mode, (float) mode);
+                p.setMonoMonitor (mode == 2);
+                std::unique_ptr<juce::AudioProcessorEditor> editor (p.createEditor());
+                auto& panel = static_cast<AnalyzerEditor*> (editor.get())->getPanel();
+                panel.refresh();
+                panel.resized();
+                const auto image = panel.createComponentSnapshot (panel.getLocalBounds(), true, 0.5f);
+                painted = painted && image.isValid() && editor->getWidth() > 0;
+            }
+    check (painted, "panel paints in every role, mode and language");
+}
+
+//==============================================================================
 int snapshot (const juce::String& path, const juce::String& roleName, const juce::String& option)
 {
     const Role role = roleName == "bus" ? Role::bus : Role::channel;
     AnalyzerProcessor p (role);
+    TestHead head;
+    p.setPlayHead (&head);
     p.setPlayConfigDetails (2, 2, rate, 256);
     p.prepareToPlay (rate, 256);
-    if (role == Role::channel && option == "send")
+    p.getEngine().stop();   // driven by hand below, not concurrently with the worker
+    const auto options = juce::StringArray::fromTokens (option, "-", "");
+    p.setEnglish (options.contains ("en"));
+    if (role == Role::channel && options.contains ("send"))
     {
         setParameter (p, ids::mode, (float) ChannelMode::sendOnly);
         p.maintainLink();   // what the plugin's timer does a moment later
     }
-    if (option == "mono")
+    if (options.contains ("mono"))
         p.setMonoMonitor (true);
+
+    std::unique_ptr<juce::AudioProcessorEditor> editor (p.createEditor());   // display analysis on
+    auto& panel = static_cast<AnalyzerEditor*> (editor.get())->getPanel();
 
     // Bus snapshot with a linked kick/bass pair, B 20 samples late.
     std::unique_ptr<Source> kick, bass;
-    if (role == Role::bus && option == "linked")
+    if (role == Role::bus && options.contains ("linked"))
     {
-        kick = std::make_unique<Source> (0, 0, [] (std::int64_t t) { return 0.6f * noiseAt (t) * 0.3f + 0.4f * sine (55, (int) t); });
-        bass = std::make_unique<Source> (1, 0, [] (std::int64_t t) { return 0.6f * noiseAt (t - 20) * 0.3f + 0.4f * sine (55, (int) (t - 20)); });
+        kick = std::make_unique<Source> (0, 0, [] (std::int64_t t) { return 0.25f * noiseAt (t) * (t % 24000 < 3000 ? 1.0f : 0.15f) + 0.5f * sine (55, (int) t); });
+        bass = std::make_unique<Source> (1, 0, [] (std::int64_t t) { return 0.12f * noiseAt (t - 20) + 0.45f * sine (55, (int) (t - 20)); });
         kick->runUntil (48000, 256);
         bass->runUntil (48000, 128);
-        p.getBusLink()->stop();   // step by hand, not concurrently with the worker
+        p.getBusLink()->stop();
         p.getBusLink()->step (link::nowMs());
     }
 
-    // A wide pad over a mono bass, so both scores have something to show.
+    // A wide pad with a resonance over a mono bass: 4 s, so loudness and history have something to show.
     juce::AudioBuffer<float> buffer (2, 256);
     juce::MidiBuffer midi;
-    for (int block = 0; block < 200; ++block)
+    for (int block = 0; block < 750; ++block)
     {
         for (int i = 0; i < 256; ++i)
         {
             const int n = block * 256 + i;
-            const float low = 0.4f * sine (55, n);
-            buffer.setSample (0, i, low + 0.2f * sine (660, n));
-            buffer.setSample (1, i, low + 0.2f * sine (660, n + 30));
+            const float low = 0.35f * sine (55, n);
+            const float pad = 0.12f * sine (660, n) + 0.05f * noiseAt (n);
+            const float padR = 0.12f * sine (660, n + 30) + 0.05f * noiseAt (n + 99991);
+            buffer.setSample (0, i, low + pad + 0.06f * sine (2400, n));
+            buffer.setSample (1, i, low + padR + 0.06f * sine (2400, n));
         }
+        head.timeline = block * 256;
         p.processBlock (buffer, midi);
+        if (block % 20 == 0)
+            p.getEngine().processPending();
     }
+    p.getEngine().processPending();
 
-    std::unique_ptr<juce::AudioProcessorEditor> editor (p.createEditor());
-    for (int i = 0; i < 3; ++i)
-        juce::MessageManager::getInstance()->runDispatchLoopUntil (80);
-    const auto image = editor->createComponentSnapshot (editor->getLocalBounds(), true, 2.0f);
+    panel.refresh();
+    panel.resized();
+    const auto image = panel.createComponentSnapshot (panel.getLocalBounds(), true, 1.0f);
     juce::File file (juce::File::getCurrentWorkingDirectory().getChildFile (path));
     file.deleteFile();
     juce::FileOutputStream out (file);
@@ -659,6 +925,10 @@ int main (int argc, char** argv)
     testLinkSync();
     testLinkStates();
     testLinkAcrossProcesses (prefix);
+    testLoudness();
+    testSpectrum();
+    testStereoAndHistory();
+    testAdviceAndPanel();
 
     if (failures == 0)
         std::printf ("\nall tests passed\n");

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/MonoScore.h"
+#include "shared/AnalysisEngine.h"
 #include "shared/BusLink.h"
 #include "shared/Parameters.h"
 #include "transport/Link.h"
@@ -41,6 +42,14 @@ public:
     juce::String getTrackName() const;
     BusLinkStatus getLinkStatus() const;
     BusLink* getBusLink() noexcept { return busLink.get(); }
+    AnalysisEngine& getEngine() noexcept { return engine; }
+
+    // Display-only analysis runs while at least one editor is open (D-29).
+    void setDisplayActive (bool active) noexcept;
+
+    // UI language, stored with the project but not a host parameter (D-06).
+    bool isEnglish() const;
+    void setEnglish (bool english);
 
     // Opens the shared slot the current settings need and publishes the track name. Runs on the
     // message thread (timer, prepare, state load); the tests call it directly.
@@ -99,6 +108,8 @@ private:
 
     // Bus Analyzer: reader side of the link
     std::unique_ptr<BusLink> busLink;
+
+    AnalysisEngine engine { meter };
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (AnalyzerProcessor)
 };
