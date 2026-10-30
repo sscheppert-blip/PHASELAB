@@ -49,6 +49,33 @@ void AnalyzerProcessor::setDisplayActive (bool active) noexcept
         busLink->setDisplayActive (active);
 }
 
+double AnalyzerProcessor::getWaveformSeconds() const
+{
+    return juce::jlimit (waveformMinSeconds, waveformMaxSeconds, (double) state.state.getProperty ("waveSeconds", 0.04));
+}
+
+void AnalyzerProcessor::setWaveformSeconds (double seconds)
+{
+    seconds = juce::jlimit (waveformMinSeconds, waveformMaxSeconds, seconds);
+    state.state.setProperty ("waveSeconds", seconds, nullptr);
+    engine.setWaveformSeconds (seconds);
+    if (busLink != nullptr)
+        busLink->setWaveformSeconds (seconds);
+}
+
+bool AnalyzerProcessor::getWaveformTrigger() const
+{
+    return (bool) state.state.getProperty ("waveTrigger", true);
+}
+
+void AnalyzerProcessor::setWaveformTrigger (bool on)
+{
+    state.state.setProperty ("waveTrigger", on, nullptr);
+    engine.setWaveformTrigger (on);
+    if (busLink != nullptr)
+        busLink->setWaveformTrigger (on);
+}
+
 bool AnalyzerProcessor::isEnglish() const
 {
     return state.state.getProperty ("language").toString() == "en";
@@ -118,6 +145,8 @@ void AnalyzerProcessor::updateTrackProperties (const TrackProperties& properties
 
 void AnalyzerProcessor::prepareToPlay (double sampleRate, int)
 {
+    setWaveformSeconds (getWaveformSeconds());   // the stored zoom may come from a loaded project
+    setWaveformTrigger (getWaveformTrigger());
     meter.setCutoff (cutoff->load());
     meter.prepare (sampleRate);
     wasAnalysing = isAnalysing();

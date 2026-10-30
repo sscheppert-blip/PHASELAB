@@ -5,7 +5,7 @@ namespace phaselab
 
 BusLink::BusLink (std::atomic<float>& groupParameter, std::atomic<float>& cutoffParameter)
     : juce::Thread ("PhaseLab Bus Link"), group (groupParameter), cutoff (cutoffParameter),
-      lastWaveA (4096, 0.0f), lastWaveB (4096, 0.0f),
+      lastWave (std::make_unique<WaveformBins>()),
       work (std::make_unique<BusLinkStatus>()), status (std::make_unique<BusLinkStatus>())
 {
 }
@@ -62,7 +62,7 @@ void BusLink::step (std::int64_t now)
     next.state = LinkState::disconnected;
     next.result = {};
     next.spectrum = {};
-    next.waveLength = 0;
+    next.wave.bins = 0;
     next.group = g;
 
     auto* slotA = slots.acquire (g, 0);
@@ -111,35 +111,33 @@ void BusLink::step (std::int64_t now)
 
         // About ten analyses per second are enough for the display; the offset search is the costly part.
         const float cut = cutoff.load();
-        if (! wasValid || std::abs (end - lastAnalysedEnd) >= (std::int64_t) (0.1 * a.sampleRate) || cut != lastCutoff)
+        const double zoom = waveSeconds.load();
+        if (! wasValid || std::abs (end - lastAnalysedEnd) >= (std::int64_t) (0.1 * a.sampleRate) || cut != lastCutoff || zoom != lastZoom)
         {
             lastResult = analyzer.analyse (windowA.data(), windowB.data(), length, a.sampleRate, cut);
             lastAnalysedEnd = end;
             lastCutoff = cut;
+            lastZoom = zoom;
 
             if (displayUsers.load() > 0)
             {
                 spectrum.prepare (a.sampleRate);
                 spectrum.analyseStretch (windowA.data(), windowB.data(), length);
                 lastSpectrum = spectrum.result();
-                lastWaveLength = std::min ((int) lastWaveA.size(), (int) std::lround (0.040 * a.sampleRate));
-                for (int i = 0; i < lastWaveLength; ++i)
-                {
-                    lastWaveA[(size_t) i] = windowA[(size_t) (length - lastWaveLength + i)];
-                    lastWaveB[(size_t) i] = windowB[(size_t) (length - lastWaveLength + i)];
-                }
+                const double seconds = juce::jlimit (waveformMinSeconds, waveformMaxSeconds, waveSeconds.load());
+                const int count = std::min (length, std::max (2, (int) std::lround (seconds * a.sampleRate)));
+                const int back = waveTrigger.load() ? std::min (length - count, (int) (0.05 * a.sampleRate)) : 0;
+                lastWave->fill (windowA.data(), windowB.data(), length, length, count, a.sampleRate, back);
             }
             else
             {
                 lastSpectrum = {};
-                lastWaveLength = 0;
+                lastWave->bins = 0;
             }
         }
         next.result = lastResult;
         next.spectrum = lastSpectrum;
-        std::copy (lastWaveA.begin(), lastWaveA.end(), next.waveA.begin());
-        std::copy (lastWaveB.begin(), lastWaveB.end(), next.waveB.begin());
-        next.waveLength = lastWaveLength;
+        next.wave = *lastWave;
         return LinkState::valid;
     };
 

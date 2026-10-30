@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22)
 
-project(PhaseLab VERSION 0.1.0 LANGUAGES C CXX)
+project(PhaseLab VERSION 0.1.1 LANGUAGES C CXX)
 
 option(PHASELAB_BUILD_TESTS "Build the offline tests" ON)
 option(PHASELAB_COPY_PLUGIN "Copy the built plugins into the user's plugin folders" ON)

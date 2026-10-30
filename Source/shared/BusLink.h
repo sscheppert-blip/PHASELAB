@@ -2,6 +2,7 @@
 
 #include "core/ABAnalysis.h"
 #include "core/Spectrum.h"
+#include "shared/AnalysisEngine.h"
 #include "transport/Link.h"
 
 #include <juce_core/juce_core.h>
@@ -42,8 +43,7 @@ struct BusLinkStatus
 
     // Display data of A and B (only while an editor is open, D-29)
     SpectrumResult spectrum;                  // x = A, y = B
-    std::array<float, 4096> waveA {}, waveB {};
-    int waveLength = 0;                       // newest 40 ms of the joined window
+    WaveformBins wave;                        // newest part of the joined window (a = A, b = B)
 };
 
 // Bus Analyzer side of the link: a worker thread follows slots A and B of the selected group,
@@ -66,6 +66,8 @@ public:
     BusLinkStatus getStatus() const;
     void getStatus (BusLinkStatus& out) const;
     void setDisplayActive (bool active) noexcept { displayUsers.fetch_add (active ? 1 : -1); }
+    void setWaveformSeconds (double seconds) noexcept { waveSeconds.store (seconds); }
+    void setWaveformTrigger (bool on) noexcept { waveTrigger.store (on); }
 
 private:
     void run() override;
@@ -85,8 +87,10 @@ private:
     std::atomic<int> displayUsers { 0 };
     SpectrumAnalyzer spectrum;
     SpectrumResult lastSpectrum;
-    std::vector<float> lastWaveA, lastWaveB;
-    int lastWaveLength = 0;
+    std::atomic<double> waveSeconds { 0.04 };
+    std::atomic<bool> waveTrigger { true };
+    double lastZoom = 0.0;
+    std::unique_ptr<WaveformBins> lastWave;
 
     // Large: kept on the heap so a processor stays small.
     std::unique_ptr<BusLinkStatus> work;

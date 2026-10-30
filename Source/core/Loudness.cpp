@@ -125,6 +125,8 @@ void LevelMeter::reset() noexcept
     rawBlocks.fill (0.0);
     blocksDone = 0;
     peakHold = truePeakHold = 0.0;
+    clipsLeft = clipsRight = clippedSamples = 0;
+    inClipLeft = inClipRight = false;
     std::fill (integratedEnergy.begin(), integratedEnergy.end(), 0.0);
     std::fill (rangeEnergy.begin(), rangeEnergy.end(), 0.0);
     std::fill (integratedCount.begin(), integratedCount.end(), 0);
@@ -146,6 +148,14 @@ void LevelMeter::process (const float* left, const float* right, int numSamples)
     for (int i = 0; i < numSamples; ++i)
     {
         const float l = left[i], r = right[i];
+
+        const bool clipL = std::abs (l) >= 1.0f, clipR = std::abs (r) >= 1.0f;
+        if (clipL && ! inClipLeft) ++clipsLeft;
+        if (clipR && ! inClipRight) ++clipsRight;
+        clippedSamples += (clipL ? 1 : 0) + (clipR ? 1 : 0);
+        inClipLeft = clipL;
+        inClipRight = clipR;
+
         peakHold = std::max (peakHold, (double) std::max (std::abs (l), std::abs (r)));
         truePeakHold = std::max (truePeakHold, (double) std::max (truePeaks[0].process (l), truePeaks[1].process (r)));
 
@@ -201,6 +211,9 @@ LevelValues LevelMeter::values() const noexcept
 {
     LevelValues v;
     v.peak = toDb (peakHold);
+    v.clipsLeft = clipsLeft;
+    v.clipsRight = clipsRight;
+    v.clippedSamples = clippedSamples;
     v.truePeak = toDb (truePeakHold);
 
     const int available = std::min (blocksDone, 30);

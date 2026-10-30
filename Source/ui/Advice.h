@@ -16,6 +16,7 @@ struct Advice
     juce::String title;
     juce::String text;
     bool warning = false;
+    bool status = false;   // a state message (no signal, link state), not an observation: may change at once
 };
 
 struct OwnInput

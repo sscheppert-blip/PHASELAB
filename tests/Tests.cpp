@@ -1,6 +1,6 @@
 // Offline tests for the analysis core, the shared processor and the link (P1 harness).
 //   PhaseLabTests                               run all tests
-//   PhaseLabTests --snapshot <png> channel|bus [send|mono|linked|en, combinable: linked-en]
+//   PhaseLabTests --snapshot <png> channel|bus [send|mono|linked|en|level|loudness|clip, combinable: linked-en]
 //                                               render the panel after feeding a test signal
 //   PhaseLabTests --link-child <prefix> <seconds> <delay>
 //                                               internal: second process sending source B
@@ -692,6 +692,21 @@ void testLoudness()
         m.prepare (rate);
         check (m.values().integrated <= noLevel && m.values().peak <= noLevel, "loudness: no value before any audio");
     }
+    {
+        // Three bursts above full scale on the left, one on the right: 4 clips, every clipped sample counted.
+        LevelMeter m;
+        m.prepare (rate);
+        runLevels (m, [] (int i, float& l, float& r)
+        {
+            const bool burst = (i >= 1000 && i < 1010) || (i >= 5000 && i < 5005) || (i >= 9000 && i < 9001);
+            l = burst ? 1.2f : 0.5f;
+            r = (i >= 20000 && i < 20004) ? -1.0f : 0.5f;
+        }, 48000);
+        const auto v = m.values();
+        check (v.clipsLeft == 3 && v.clipsRight == 1 && v.clippedSamples == 20, "clipping: clips and clipped samples are counted per channel");
+        m.reset();
+        check (m.values().clips() == 0 && m.values().clippedSamples == 0, "clipping: reset clears the count");
+    }
 }
 
 void testSpectrum()
@@ -778,7 +793,9 @@ void testStereoAndHistory()
     engine.copySnapshot (*snapshot);
     const auto& last = snapshot->history[(size_t) History::points - 1];
     check (last.valid && last.value > 0.99f && last.bar > 1.4 && last.bar < 1.6, "history: points every 100 ms carry correlation and bar position (bar 1.5 after 1 s)");
-    check (! snapshot->spectrum.valid && snapshot->waveLength == 0, "display analysis stays off while no editor is open (D-29)");
+    check (last.peak > -7.0f && last.peak < -5.9f && last.rms > -20.0f && last.rms < -9.0f && last.momentary > noLevel && ! last.clipped,
+           "history: points also carry peak, RMS and loudness");
+    check (! snapshot->spectrum.valid && snapshot->wave.bins == 0, "display analysis stays off while no editor is open (D-29)");
 
     engine.setDisplayActive (true);
     for (int block = 0; block < 40; ++block)
@@ -789,7 +806,45 @@ void testStereoAndHistory()
     }
     engine.processPending();
     engine.copySnapshot (*snapshot);
-    check (snapshot->spectrum.valid && snapshot->waveLength > 0, "display analysis runs while an editor is open");
+    check (snapshot->spectrum.valid && snapshot->wave.bins > 0, "display analysis runs while an editor is open");
+
+    // Waveform zoom: 2 ms shows single samples, 400 ms shows min/max per bin over the whole window.
+    engine.setWaveformSeconds (0.002);
+    engine.push (l.data(), r.data(), 480, {});
+    engine.processPending();
+    engine.copySnapshot (*snapshot);
+    const bool shortWindow = snapshot->wave.bins == 96 && snapshot->wave.minA[5] == snapshot->wave.maxA[5];
+    engine.setWaveformSeconds (0.4);
+    engine.push (l.data(), r.data(), 480, {});
+    engine.processPending();
+    engine.copySnapshot (*snapshot);
+    check (shortWindow && snapshot->wave.bins == waveformBins && std::abs (snapshot->wave.seconds - 0.4) < 0.001
+               && snapshot->wave.maxA[100] > snapshot->wave.minA[100],
+           "waveform zoom: 2 ms shows every sample, 400 ms the min/max of each bin");
+
+    // Trigger: a 100 Hz sine starts every picture at its rising zero crossing, so it stands still.
+    engine.setWaveformSeconds (0.004);   // 192 samples: one bin per sample
+    engine.setWaveformTrigger (true);
+    bool steady = true;
+    for (int round = 0; round < 5; ++round)
+    {
+        for (int block = 0; block < 7; ++block)   // 7 × 480 samples: never a whole number of cycles per round
+        {
+            const int offset = (round * 7 + block) * 480 + 13;
+            for (int i = 0; i < 480; ++i)
+                l[(size_t) i] = r[(size_t) i] = 0.8f * sine (100, offset + i);
+            engine.push (l.data(), r.data(), 480, {});
+        }
+        engine.processPending();
+        engine.copySnapshot (*snapshot);
+        const auto& wv = snapshot->wave;
+        steady = steady && wv.triggered && std::abs (wv.maxA[0]) < 0.06f && wv.maxA[10] > wv.maxA[0];
+    }
+    engine.setWaveformTrigger (false);
+    engine.push (l.data(), r.data(), 100, {});
+    engine.processPending();
+    engine.copySnapshot (*snapshot);
+    check (steady && ! snapshot->wave.triggered, "waveform trigger: a periodic signal starts at its rising zero crossing every time");
 
     for (int block = 0; block < 400; ++block)   // 4 s without the worker: more than the FIFO holds
         engine.push (l.data(), r.data(), 480, {});
@@ -797,6 +852,26 @@ void testStereoAndHistory()
     engine.copySnapshot (*snapshot);
     check (snapshot->overflow, "a worker that falls behind marks the gap instead of blocking the audio thread");
     engine.setDisplayActive (false);
+
+    // Whole-song history: one point per second while the host plays, nothing while it is stopped.
+    MonoScoreMeter songMeter;
+    AnalysisEngine songEngine (songMeter);
+    songEngine.prepare (rate);
+    for (int block = 0; block < 500; ++block)   // 5 s: 3 s playing, then 2 s stopped and silent
+    {
+        const bool playing = block < 300;
+        for (int i = 0; i < 480; ++i)
+            l[(size_t) i] = r[(size_t) i] = playing ? noiseAt (block * 480 + i) : 0.0f;
+        BlockInfo info;
+        info.playing = playing;
+        info.hasMusicalPosition = true;
+        songEngine.push (l.data(), r.data(), 480, info);
+        songEngine.processPending();
+    }
+    std::vector<History::Point> song;
+    songEngine.copyLongHistory (song);
+    check (song.size() == 3 && song.back().peak > -7.0f && song.back().momentary > noLevel,
+           "song history: one point per second while playing, none while stopped");
 }
 
 void testAdviceAndPanel()
@@ -811,6 +886,15 @@ void testAdviceAndPanel()
 
     snapshot->levels.truePeak = -0.3;
     check (ui::adviseOwnInput (wideBass, false).title.contains ("True Peak"), "advice: true peak above -1 dBTP comes first");
+
+    {
+        auto monoTrack = std::make_unique<EngineSnapshot>();
+        monoTrack->stereo.valid = true;
+        monoTrack->stereo.correlation = 1.0;
+        monoTrack->stereo.sidePercent = 0.0;
+        const auto a = ui::adviseOwnInput ({ *monoTrack, 100, 100, 120.0 }, false);
+        check (a.title.contains ("mono") && a.text.contains ("Panning"), "advice: an exactly mono track explains that the DAW pans after the plugin");
+    }
 
     BusLinkStatus link;
     link.state = LinkState::valid;
@@ -834,6 +918,7 @@ void testAdviceAndPanel()
                 if (role == Role::channel)
                     setParameter (p, ids::mode, (float) mode);
                 p.setMonoMonitor (mode == 2);
+                p.getState().state.setProperty ("historyMode", (english ? 1 : 0) + (mode == 2 ? 1 : 0), nullptr);
                 std::unique_ptr<juce::AudioProcessorEditor> editor (p.createEditor());
                 auto& panel = static_cast<AnalyzerEditor*> (editor.get())->getPanel();
                 panel.refresh();
@@ -863,6 +948,13 @@ int snapshot (const juce::String& path, const juce::String& roleName, const juce
     }
     if (options.contains ("mono"))
         p.setMonoMonitor (true);
+    if (options.contains ("level"))
+        p.getState().state.setProperty ("historyMode", 1, nullptr);
+    if (options.contains ("loudness"))
+        p.getState().state.setProperty ("historyMode", 2, nullptr);
+    if (options.contains ("corr"))
+        p.getState().state.setProperty ("historyMode", 0, nullptr);
+    const bool clip = options.contains ("clip");
 
     std::unique_ptr<juce::AudioProcessorEditor> editor (p.createEditor());   // display analysis on
     auto& panel = static_cast<AnalyzerEditor*> (editor.get())->getPanel();
@@ -882,7 +974,9 @@ int snapshot (const juce::String& path, const juce::String& roleName, const juce
     // A wide pad with a resonance over a mono bass: 4 s, so loudness and history have something to show.
     juce::AudioBuffer<float> buffer (2, 256);
     juce::MidiBuffer midi;
-    for (int block = 0; block < 750; ++block)
+    const int blocks = options.contains ("long") ? 3750 : 750;   // 20 s or 4 s
+    const bool pulse = options.contains ("pulse");                // kick-like level every half second
+    for (int block = 0; block < blocks; ++block)
     {
         for (int i = 0; i < 256; ++i)
         {
@@ -890,8 +984,17 @@ int snapshot (const juce::String& path, const juce::String& roleName, const juce
             const float low = 0.35f * sine (55, n);
             const float pad = 0.12f * sine (660, n) + 0.05f * noiseAt (n);
             const float padR = 0.12f * sine (660, n + 30) + 0.05f * noiseAt (n + 99991);
-            buffer.setSample (0, i, low + pad + 0.06f * sine (2400, n));
-            buffer.setSample (1, i, low + padR + 0.06f * sine (2400, n));
+            float boost = clip && (n / 24000) % 3 == 2 && n % 24000 < 1200 ? 2.4f : 1.0f;   // overloads now and then
+            if (pulse)
+                boost *= 0.35f + 0.9f * std::exp (-(float) (n % 24000) / 2400.0f);
+            float left = boost * (low + pad + 0.06f * sine (2400, n));
+            float right = boost * (low + padR + 0.06f * sine (2400, n));
+            if (options.contains ("monotrack"))
+                right = left;                       // a mono source: L = R
+            if (options.contains ("hardleft"))
+                right = 0.0f;                       // panned hard left
+            buffer.setSample (0, i, left);
+            buffer.setSample (1, i, right);
         }
         head.timeline = block * 256;
         p.processBlock (buffer, midi);
@@ -902,6 +1005,20 @@ int snapshot (const juce::String& path, const juce::String& roleName, const juce
 
     panel.refresh();
     panel.resized();
+    if (options.contains ("phase") || options.contains ("ms"))
+        panel.showView (1);
+    if (options.contains ("loss"))
+        panel.showView (2);
+    if (options.contains ("song"))
+        panel.showHistory (0);
+    if (options.contains ("zoomout") || options.contains ("zoomin"))
+    {
+        p.setWaveformSeconds (options.contains ("zoomout") ? 0.3 : 0.004);
+        if (auto* busLink = p.getBusLink())
+            busLink->step (link::nowMs());
+        p.getEngine().processPending();
+        panel.refresh();
+    }
     const auto image = panel.createComponentSnapshot (panel.getLocalBounds(), true, 1.0f);
     juce::File file (juce::File::getCurrentWorkingDirectory().getChildFile (path));
     file.deleteFile();

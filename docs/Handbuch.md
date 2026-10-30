@@ -11,7 +11,7 @@ verständlichen Worten, was du prüfen kannst. Es gibt zwei Plugins:
 PhaseLab analysiert nur, dein Audio läuft unverändert durch. Die einzige Ausnahme ist der Schalter
 **MONO** zum Abhören (siehe unten).
 
-> Version 0.1.0. Getestet mit eigenen Tests und pluginval unter Windows. In DAWs und unter macOS/Linux
+> Version 0.1.1. Getestet mit eigenen Tests und pluginval unter Windows. In DAWs und unter macOS/Linux
 > noch nicht geprüft.
 
 ## 1. Installation
@@ -78,13 +78,26 @@ Den Spurnamen übernimmt PhaseLab vom Host, wenn das Format ihn liefert.
   schmalen Überhöhung. Im Bus Analyzer A und B übereinander, solange der Vergleich gültig ist, sonst das
   eigene Eingangssignal.
 - **Stereo M/S** (Channel Analyzer): Mitten- und Seitensignal getrennt.
-- **Phase A/B** (Bus Analyzer): die Phase von B gegenüber A je Terzband.
+- **Phase A/B** (Bus Analyzer): um wie viel Grad B gegenüber A je Terzband verschoben ist. 0° heißt
+  gleichphasig (addiert sich), ±180° gegenphasig (löscht sich aus). Ein zeitlicher Versatz erscheint
+  als Linie, die mit der Frequenz abfällt. Deutlich gezeichnet werden nur Bänder, in denen A und B
+  zusammenhängen (Band-Korrelation ab 0,3), die anderen nur blass. Bei Kick gegen Bass sind das oft
+  wenige, bei Bass DI gegen Amp oder zwei Mikros an einer Trommel fast alle.
 - **Mono-Verlust**: wie viele dB die Monosumme je Frequenzbereich verliert. Null heißt: kein Verlust.
 
 **Band-Streifen** unter dem Graphen: die Korrelation je Terzband. Grün bedeutet gleichphasig, rot
 auslöschend, grau zu leise. Im Channel Analyzer zwischen L und R, im Bus Analyzer zwischen A und B.
 
-**Dual-Waveform**: die letzten 40 ms von L/R bzw. A/B auf derselben Zeitachse.
+**Dual-Waveform**: L/R bzw. A/B auf derselben Zeitachse. Mit dem Regler in der Titelleiste wählst du
+das Zeitfenster von 2 ms (einzelne Schwingungen und Samples) bis 400 ms (viele Bass-Wellen, Kick und
+Bass im Zusammenspiel); Doppelklick setzt 40 ms. Bei langen Fenstern zeigt jeder Bildpunkt die Spanne
+vom tiefsten bis zum höchsten Wert, wie eine Waveform in der DAW. Die Einstellung wird im Projekt
+gespeichert.
+
+Im Bus Analyzer blenden die Schalter **A** und **B** eine Kurve aus – in der Waveform und im
+A/B-Spektrum (sie erscheinen, solange der A/B-Vergleich gültig ist). **Trigger** (Standard: an) lässt das Bild wie bei einem Oszilloskop
+immer an einem aufsteigenden Nulldurchgang des Basses von A bzw. L beginnen. Periodische Signale stehen
+dann still, und du kannst die Lage der Berge und Täler von A und B in Ruhe vergleichen.
 
 **HOLD** hält die Anzeige an, das Audio läuft weiter.
 
@@ -96,16 +109,43 @@ auslöschend, grau zu leise. Im Channel Analyzer zwischen L und R, im Bus Analyz
   50, für breite Pads ist das normal. Der Score ist ein Hinweis, kein Qualitätsurteil.
 - **unter … Hz**: derselbe Score nur für den Bassbereich. Mit dem Regler verschiebst du die
   Grenzfrequenz zwischen 40 und 500 Hz, Standard ist 120 Hz.
-- **L/R-Korrelation**, **Goniometer**, **Side**-Anteil und **Balance**.
+- **L/R-Korrelation**, **Goniometer**, **Side**-Anteil und **Balance**. Hinweis: In den meisten DAWs
+  wirkt der Pan-Regler einer Spur erst *nach* den Insert-Plugins. Der Channel Analyzer sieht daher das
+  ungepannte Signal – eine Mono-Spur bleibt in der Mitte. Die gepannte Summe zeigt der Bus Analyzer.
 - **Peak**, **True Peak**, **RMS** (300 ms), **LUFS kurz** (3 s), **LUFS integriert** und **LRA**. Gemessen
   nach ITU-R BS.1770 / EBU R128. True Peak über −1 dBTP wird orange.
 - **Messung zurücksetzen** startet Peak, True Peak, integrierte Lautheit, LRA und History neu.
 
 ## 6. History
 
-Die History zeigt die L/R-Korrelation (türkis) und den Mono-Score (sand) der letzten 30, 60 oder 90
-Sekunden. Liefert der Host Takt und Tempo, steht unter der Zeitachse auch der Takt (z. B. „T. 33“),
-damit du die Stelle im Arrangement wiederfindest.
+Die History zeigt den Verlauf über die Zeit – ähnlich der Zeitleiste eines Loudness-Meters. Mit den
+Knöpfen links wählst du, was sie zeigt (die Wahl wird im Projekt gespeichert):
+
+- **Lautheit** (Standard): LUFS kurz als gefüllte Fläche, LUFS momentan als Linie und die integrierte
+  Lautheit seit dem Zurücksetzen als gestrichelte Linie mit Wert.
+- **Pegel**: Peak als gefüllte Hüllkurve, RMS als Linie, in dBFS.
+- **Korrelation**: L/R-Korrelation und Mono-Score (eigene Achse rechts, 0–100).
+
+Clips sind in Lautheit und Pegel rot markiert. Rechts wählst du das Zeitfenster: **30, 60 oder 90 s**
+(die letzten Sekunden, fein aufgelöst) oder **Song** – den ganzen Verlauf seit dem letzten Zurücksetzen,
+bis zu zwei Stunden, mit Minuten und Takten an der Zeitachse. Aufgezeichnet wird, während der Host
+abspielt; Stopp-Pausen erzeugen keine Lücken. „Messung zurücksetzen“ beginnt den Verlauf neu.
+
+Die Kurven sind zur besseren Lesbarkeit geglättet, die Skala passt sich dem sichtbaren Material an.
+Liefert der Host Takt und Tempo, steht unter der Zeitachse auch der Takt (z. B. „T. 33“).
+
+## Clipping
+
+Ein Sample bei 0 dBFS oder darüber zählt als Clipping. Mehrere direkt aufeinanderfolgende Samples sind
+ein Clip. PhaseLab zeigt:
+
+- eine rote Clip-LED über dem Pegelmeter des betroffenen Kanals (leuchtet 3 Sekunden),
+- den Zähler „Clips N · M Samples“ seit dem letzten Zurücksetzen, rot sobald etwas geclippt hat,
+- Peak und True Peak in Rot, sobald sie 0 dB erreichen,
+- rote Marken in der History (Ansicht Pegel),
+- und als ersten Hinweis „Clipping“, solange es in den letzten 3 Sekunden geclippt hat.
+
+„Messung zurücksetzen“ setzt den Zähler zurück.
 
 ## 7. Hinweise
 

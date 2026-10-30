@@ -53,7 +53,17 @@ Advice adviseOwnInput (const OwnInput& in, bool en)
 {
     const auto& s = in.snapshot;
     if (! s.stereo.valid)
-        return { tr (en, "Kein Signal", "No signal"), tr (en, "Sobald Audio anliegt, erscheinen hier Hinweise.", "Hints appear here as soon as audio arrives."), false };
+        return { tr (en, "Kein Signal", "No signal"), tr (en, "Sobald Audio anliegt, erscheinen hier Hinweise.", "Hints appear here as soon as audio arrives."), false, true };
+
+    // Clipping in the last 3 seconds comes first.
+    bool recentClip = false;
+    for (int i = History::points - 30; i < History::points; ++i)
+        recentClip = recentClip || s.history[(size_t) i].clipped;
+    if (recentClip)
+        return { tr (en, "Clipping: ", "Clipping: ") + juce::String (s.levels.clips()) + tr (en, " Clips seit Reset", " clips since reset"),
+                 tr (en, "Das Signal erreicht 0 dBFS (", "The signal reaches 0 dBFS (") + juce::String (s.levels.clippedSamples)
+                     + tr (en, " Samples) – Pegel vor diesem Plugin senken. „Messung zurücksetzen“ setzt den Zähler zurück.",
+                           " samples) – lower the level before this plugin. “Reset measurement” clears the count."), true };
 
     if (s.levels.truePeak > -1.0)
         return { tr (en, "True Peak über −1 dBTP", "True peak above −1 dBTP"),
@@ -83,6 +93,12 @@ Advice adviseOwnInput (const OwnInput& in, bool en)
                  tr (en, "Links und rechts arbeiten gegeneinander – Polarität eines Kanals oder starke Stereo-Effekte prüfen.",
                      "Left and right work against each other – check the polarity of one channel or strong stereo effects."), true };
 
+    // Exactly mono (L = R): the track's pan acts after the insert, so the stereo views stay centred.
+    if (s.stereo.correlation > 0.9999 && s.stereo.sidePercent < 0.01)
+        return { tr (en, "Spur ist mono (L = R)", "Track is mono (L = R)"),
+                 tr (en, "Stereo-Ansichten bleiben in der Mitte: Das Panning der DAW wirkt erst nach den Insert-Plugins. Im Bus Analyzer siehst du die gepannte Summe.",
+                     "The stereo views stay centred: the DAW pans after the insert plugins. The Bus Analyzer shows the panned sum."), false };
+
     if (s.spectrum.valid && s.spectrum.resonanceHz > 0.0)
         return { tr (en, "Schmale Überhöhung bei ", "Narrow peak at ") + frequency (s.spectrum.resonanceHz, en) + " (+" + number (s.spectrum.resonanceDb, 1, en) + " dB)",
                  tr (en, "Bereich gezielt abhören. Kann zum Klang gehören.", "Listen to this range on its own. It may be part of the sound."), false };
@@ -100,7 +116,7 @@ Advice adviseBus (const OwnInput& in, const BusLinkStatus& link, bool en)
             return adviseOwnInput (in, en);
         return { linkStateText (link.state, en),
                  tr (en, "Zeitkritische A/B-Werte werden erst angezeigt, wenn der Vergleich gültig ist.",
-                     "Time-critical A/B values are shown only while the comparison is valid."), false };
+                     "Time-critical A/B values are shown only while the comparison is valid."), false, true };
     }
 
     const auto& r = link.result;

@@ -6,7 +6,7 @@ DI and amp. PhaseLab shows phase relations, cancellations, mono compatibility, n
 the stereo image and loudness, and explains in plain words what to check. It only analyses – the
 audio passes through unchanged. VST3, CLAP and AU, built with JUCE.
 
-> **Status: version 0.1.0.** Everything described here is built and passes its own tests (including
+> **Status: version 0.1.1.** Everything described here is built and passes its own tests (including
 > EBU loudness reference cases and a link across two processes) and pluginval at strictness 10 on
 > Windows. Not yet tested in a DAW, macOS and Linux builds come from the release workflow
 > ([host test](docs/Hosttest.md)).
@@ -28,10 +28,14 @@ audio passes through unchanged. VST3, CLAP and AU, built with JUCE.
 - **Mono compatibility:** mono score 0–100 for the full band and below a cutoff you can move
   (40–500 Hz, default 120 Hz), correlation per third octave (green in phase, red cancelling) and a
   spectrum of what the mono sum loses
-- **Spectrum** with the most striking narrow resonance marked, mid/side view, dual waveform
+- **Spectrum** with the most striking narrow resonance marked, mid/side view, dual waveform with a
+  zoom from 2 to 400 ms, an oscilloscope-style trigger and switches to hide A or B
 - **Stereo:** goniometer, L/R correlation, side share, balance
 - **Loudness after BS.1770 / EBU R128:** peak, true peak, RMS, LUFS short-term and integrated, LRA
-- **History** of 30, 60 or 90 seconds, labelled with the bar where the host provides it
+- **Loudness timeline** like a loudness meter: short-term loudness as a filled area with momentary and
+  integrated loudness, or level (peak envelope and RMS), or correlation – over the last 30/60/90 s or
+  the whole song (up to two hours), labelled with minutes and bars
+- **Clipping** in red: clip LEDs, a counter of clips and clipped samples, red marks in the history
 - **Hints in plain words** – what was measured, where, and what to check or listen to; never an
   automatic change
 - **Mono monitor:** the only switch that changes the audio – sums the output to mono for listening,

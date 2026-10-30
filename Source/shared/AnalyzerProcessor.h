@@ -47,6 +47,12 @@ public:
     // Display-only analysis runs while at least one editor is open (D-29).
     void setDisplayActive (bool active) noexcept;
 
+    // Waveform zoom (2 … 400 ms), stored with the plugin state as a viewer convenience.
+    double getWaveformSeconds() const;
+    void setWaveformSeconds (double seconds);
+    bool getWaveformTrigger() const;
+    void setWaveformTrigger (bool on);
+
     // UI language, stored with the project but not a host parameter (D-06).
     bool isEnglish() const;
     void setEnglish (bool english);

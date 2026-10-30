@@ -1,6 +1,8 @@
 #include "ui/Panel.h"
 
+#include <algorithm>
 #include <cmath>
+#include <vector>
 
 namespace phaselab::ui
 {
@@ -20,7 +22,7 @@ namespace
 
     juce::String levelText (double v, bool en, int places = 1)
     {
-        return v <= noLevel + 1.0 ? juce::String::fromUTF8 ("–") : number (v, places, en);
+        return v <= noLevel + 1.0 ? juce::String::fromUTF8 ("–") : number (v, places, en, v > 0.0);
     }
 
     void drawFrequencyGrid (juce::Graphics& g, juce::Rectangle<float> r, bool labels)
@@ -102,13 +104,18 @@ Panel::Panel (AnalyzerProcessor& p)
     monoButton.onClick = [this] { processor.setMonoMonitor (monoButton.getToggleState()); layoutControls(); repaint(); };
     addAndMakeVisible (monoButton);
 
-    languageButton.onClick = [this] { processor.setEnglish (! english()); updateTexts(); repaint(); };
+    languageButton.onClick = [this] { processor.setEnglish (! english()); updateTexts(); shownKind.clear(); updateAdvice(); repaint(); };
     addAndMakeVisible (languageButton);
 
     holdButton.setClickingTogglesState (true);
     addAndMakeVisible (holdButton);
 
-    resetButton.onClick = [this] { processor.getEngine().requestReset(); peakHoldLeft = peakHoldRight = 0.0f; };
+    resetButton.onClick = [this]
+    {
+        processor.getEngine().requestReset();
+        peakHoldLeft = peakHoldRight = 0.0f;
+        clipLeftUntil = clipRightUntil = 0;
+    };
     addAndMakeVisible (resetButton);
 
     for (int i = 0; i < 3; ++i)
@@ -120,12 +127,30 @@ Panel::Panel (AnalyzerProcessor& p)
 
         const int secs = 30 * (i + 1);
         historyButtons[i].setButtonText (juce::String (secs) + " s");
+    }
+    for (int i = 0; i < 3; ++i)
+    {
+        historyModeButtons[i].setRadioGroupId (3);
+        historyModeButtons[i].setClickingTogglesState (true);
+        historyModeButtons[i].onClick = [this, i]
+        {
+            if (historyModeButtons[i].getToggleState())
+                processor.getState().state.setProperty ("historyMode", i, nullptr);
+            repaint();
+        };
+        addAndMakeVisible (historyModeButtons[i]);
+    }
+    historyModeButtons[juce::jlimit (0, 2, historyMode())].setToggleState (true, juce::dontSendNotification);
+    viewButtons[0].setToggleState (true, juce::dontSendNotification);
+    for (int i = 0; i < 4; ++i)
+    {
+        const int secs = i < 3 ? 30 * (i + 1) : 0;
         historyButtons[i].setRadioGroupId (2);
         historyButtons[i].setClickingTogglesState (true);
         historyButtons[i].onClick = [this, secs] { historySeconds = secs; repaint(); };
         addAndMakeVisible (historyButtons[i]);
     }
-    viewButtons[0].setToggleState (true, juce::dontSendNotification);
+    historyButtons[3].setButtonText ("Song");
     historyButtons[1].setToggleState (true, juce::dontSendNotification);
 
     auto addCombo = [this] (juce::ComboBox& box)
@@ -147,6 +172,29 @@ Panel::Panel (AnalyzerProcessor& p)
     }
 
     cutoffSlider.onValueChange = [this] { repaint(); };
+
+    // Waveform zoom: 2 … 400 ms, logarithmic travel (40 ms in the middle-ish)
+    waveZoom.setRange (waveformMinSeconds * 1000.0, waveformMaxSeconds * 1000.0, 0.1);
+    waveZoom.setSkewFactorFromMidPoint (28.0);
+    waveZoom.setValue (processor.getWaveformSeconds() * 1000.0, juce::dontSendNotification);
+    waveZoom.setDoubleClickReturnValue (true, 40.0);
+    waveZoom.onValueChange = [this] { processor.setWaveformSeconds (waveZoom.getValue() / 1000.0); repaint(); };
+    addAndMakeVisible (waveZoom);
+
+    for (int i = 0; i < 2; ++i)
+    {
+        traceButtons[i].setClickingTogglesState (true);
+        traceButtons[i].setToggleState (true, juce::dontSendNotification);
+        traceButtons[i].setButtonText (i == 0 ? "A" : "B");
+        traceButtons[i].setColour (juce::TextButton::textColourOnId, i == 0 ? c::a : c::b);
+        traceButtons[i].setColour (juce::TextButton::textColourOffId, c::sub.withAlpha (0.45f));
+        traceButtons[i].onClick = [this] { repaint(); };
+        addChildComponent (traceButtons[i]);
+    }
+    triggerButton.setClickingTogglesState (true);
+    triggerButton.setToggleState (processor.getWaveformTrigger(), juce::dontSendNotification);
+    triggerButton.onClick = [this] { processor.setWaveformTrigger (triggerButton.getToggleState()); repaint(); };
+    addAndMakeVisible (triggerButton);
     addAndMakeVisible (cutoffSlider);
     cutoffAttachment = std::make_unique<SliderAttachment> (processor.getState(), ids::bandCutoff, cutoffSlider);
 
@@ -163,6 +211,29 @@ Panel::~Panel()
     setLookAndFeel (nullptr);
 }
 
+void Panel::showView (int index)
+{
+    index = juce::jlimit (0, 2, index);
+    viewButtons[index].setToggleState (true, juce::dontSendNotification);
+    view = (View) index;
+    repaint();
+}
+
+void Panel::showHistory (int seconds)
+{
+    const int index = seconds == 0 ? 3 : juce::jlimit (0, 2, seconds / 30 - 1);
+    historyButtons[index].setToggleState (true, juce::dontSendNotification);
+    historySeconds = seconds;
+    songVersion = -1;
+    refresh();
+    repaint();
+}
+
+int Panel::historyMode() const
+{
+    return juce::jlimit (0, 2, (int) processor.getState().state.getProperty ("historyMode", 2));   // loudness by default
+}
+
 void Panel::updateTexts()
 {
     const bool en = english();
@@ -171,12 +242,23 @@ void Panel::updateTexts()
     monoButton.setTooltip (tr (en, "Ausgang zum Abhören mono summieren (einzige Funktion, die das Audio ändert)",
                                "Sum the output to mono for listening (the only function that changes the audio)"));
     holdButton.setTooltip (tr (en, "Anzeige anhalten", "Freeze the display"));
+    waveZoom.setTooltip (tr (en, "Zeitfenster der Waveform: 2 ms bis 400 ms (Doppelklick: 40 ms)",
+                             "Waveform time window: 2 ms to 400 ms (double-click: 40 ms)"));
+    triggerButton.setButtonText ("Trigger");
+    triggerButton.setTooltip (tr (en, "Fenster startet an einem aufsteigenden Nulldurchgang des Basses von A/L – periodische Signale stehen still",
+                                  "Window starts at a rising zero crossing of the low end of A/L – periodic signals stand still"));
+    for (auto& b : traceButtons)
+        b.setTooltip (tr (en, "Kurve ein- oder ausblenden (Waveform und A/B-Spektrum)", "Show or hide this curve (waveform and A/B spectrum)"));
     resetButton.setButtonText (tr (en, "Messung zurücksetzen", "Reset measurement"));
     resetButton.setTooltip (tr (en, "Peak, True Peak, integrierte Lautheit, LRA und History neu beginnen",
                                 "Restart peak, true peak, integrated loudness, LRA and history"));
     viewButtons[0].setButtonText (tr (en, "Spektrum", "Spectrum"));
     viewButtons[1].setButtonText (isChannel ? juce::String ("Stereo M/S") : juce::String ("Phase A/B"));
     viewButtons[2].setButtonText (tr (en, "Mono-Verlust", "Mono loss"));
+    historyModeButtons[0].setButtonText (tr (en, "Korrelation", "Correlation"));
+    historyModeButtons[1].setButtonText (tr (en, "Pegel", "Level"));
+    historyModeButtons[2].setButtonText (tr (en, "Lautheit", "Loudness"));
+    historyButtons[3].setTooltip (tr (en, "Ganzer Verlauf seit dem letzten Zurücksetzen (bis 2 Stunden)", "Whole history since the last reset (up to two hours)"));
     groupBox.setTooltip (tr (en, "Vergleichsgruppe", "Comparison group"));
     if (isChannel)
     {
@@ -203,8 +285,18 @@ void Panel::refresh()
         if (auto* busLink = processor.getBusLink())
             busLink->getStatus (link);
     }
+    const auto now = juce::Time::getMillisecondCounter();
     if (snapshot->overflow)
-        gapShownUntil = juce::Time::getMillisecondCounter() + 2000;
+        gapShownUntil = now + 2000;
+    if (snapshot->clipLeft)
+        clipLeftUntil = now + 3000;
+    if (snapshot->clipRight)
+        clipRightUntil = now + 3000;
+    if (historySeconds == 0 && processor.getEngine().getLongHistoryVersion() != songVersion && ! holdButton.getToggleState())
+    {
+        songVersion = processor.getEngine().getLongHistoryVersion();
+        processor.getEngine().copyLongHistory (songPoints);
+    }
     fullScore = processor.getMeter().fullScore();
     bandScore = processor.getMeter().bandScore();
 
@@ -219,8 +311,69 @@ void Panel::refresh()
 
     if (monoButton.getToggleState() != processor.isMonoMonitor())
         monoButton.setToggleState (processor.isMonoMonitor(), juce::dontSendNotification);
+    // A/B switches only in the Bus Analyzer while A and B are compared; hidden curves come back
+    // when the switches disappear.
+    const bool abSource = ! isChannel && link.state == LinkState::valid && lastAnalysing;
+    if (traceButtons[0].isVisible() != abSource)
+    {
+        for (auto& b : traceButtons)
+            b.setVisible (abSource);
+        triggerButton.setTopLeftPosition (waveTitleArea.getX() + (abSource ? 260 : 160), triggerButton.getY());
+    }
+    if (std::abs (waveZoom.getValue() - processor.getWaveformSeconds() * 1000.0) > 0.05 && ! waveZoom.isMouseButtonDown())
+        waveZoom.setValue (processor.getWaveformSeconds() * 1000.0, juce::dontSendNotification);   // e.g. after loading a project
     if (lastMono != processor.isMonoMonitor() || lastAnalysing != processor.isAnalysing())
         layoutControls();
+    updateAdvice();
+}
+
+void Panel::updateAdvice()
+{
+    // Measurements move with the music; a hint must stay long enough to be read:
+    // - the same kind of hint (title without its numbers) refreshes its values at most once a second,
+    // - another kind takes over only after it has held for 1.5 s, and after the current one was
+    //   visible for 5 s – a warning replaces a calm message without the 5 s wait.
+    const bool en = english();
+    const OwnInput in { *snapshot, fullScore, bandScore, cutoffSlider.getValue() };
+    const auto candidate = isChannel ? adviseOwnInput (in, en) : adviseBus (in, link, en);
+
+    juce::String kind;
+    for (auto ch : candidate.title)
+        if (! juce::CharacterFunctions::isDigit (ch) && ch != ',' && ch != '.' && ch != '+' && ch != (juce::juce_wchar) 0x2212)
+            kind << juce::String::charToString (ch);
+
+    const auto now = juce::Time::getMillisecondCounter();
+    if (shownKind.isEmpty() || (kind == shownKind && now - textUpdated >= 1000) || (shownIdle && kind != shownKind))
+    {
+        if (kind != shownKind)
+            shownSince = now;
+        shownIdle = candidate.status;
+        shownAdvice = candidate;
+        shownKind = kind;
+        textUpdated = now;
+        pendingKind.clear();
+        return;
+    }
+    if (kind == shownKind)
+    {
+        pendingKind.clear();
+        return;
+    }
+    if (kind != pendingKind)
+    {
+        pendingKind = kind;
+        pendingSince = now;
+        return;
+    }
+    const bool upgrade = candidate.warning && ! shownAdvice.warning;
+    if (now - pendingSince >= 1500 && (upgrade || now - shownSince >= 5000))
+    {
+        shownAdvice = candidate;
+        shownKind = kind;
+        shownSince = textUpdated = now;
+        shownIdle = candidate.status;
+        pendingKind.clear();
+    }
 }
 
 void Panel::resized()
@@ -239,7 +392,7 @@ void Panel::layoutControls()
     sourceArea = r.removeFromTop (50);
     footerArea = r.removeFromBottom (30);
     adviceArea = r.removeFromBottom (36);
-    historyArea = r.removeFromBottom (112);
+    historyArea = r.removeFromBottom (140);   // room for a loudness timeline
     workArea = r;
 
     auto work = r;
@@ -261,6 +414,8 @@ void Panel::layoutControls()
     monitorTitle = m.removeFromTop (32);
     m.removeFromTop (8);
     resetRect = m.removeFromBottom (40).reduced (12, 5);
+    clipRect = resetRect.removeFromRight (resetRect.getWidth() / 2 - 4);
+    resetRect.removeFromRight (8);
     valuesRect = m.removeFromBottom (126);
     stereoFoot = m.removeFromBottom (26);
     auto body = m;
@@ -294,15 +449,23 @@ void Panel::layoutControls()
         viewButtons[i].setBounds (toolbarArea.getX() + 12 + i * 120, toolbarArea.getCentreY() - 15, 112, 30);
     holdButton.setBounds (toolbarArea.getRight() - 12 - 64, toolbarArea.getCentreY() - 15, 64, 30);
     for (int i = 0; i < 3; ++i)
-        historyButtons[i].setBounds (historyArea.getRight() - 12 - (3 - i) * 58, historyArea.getY() + 4, 52, 24);
+        historyButtons[i].setBounds (historyArea.getRight() - 12 - (4 - i) * 58, historyArea.getY() + 4, 52, 24);
+    historyButtons[3].setBounds (historyArea.getRight() - 12 - 58, historyArea.getY() + 4, 52, 24);
+    for (int i = 0; i < 3; ++i)   // loudness, level, correlation from left to right
+        historyModeButtons[i].setBounds (historyArea.getX() + 96 + (2 - i) * 98, historyArea.getY() + 4, 92, 24);
     sliderRect = sliderRect.reduced (2, 0);
     cutoffSlider.setBounds (sliderRect);
     resetButton.setBounds (resetRect);
+    waveZoom.setBounds (waveTitleArea.getRight() - 12 - 150, waveTitleArea.getCentreY() - 9, 150, 18);
+    for (int i = 0; i < 2; ++i)
+        traceButtons[i].setBounds (waveTitleArea.getX() + 160 + i * 46, waveTitleArea.getCentreY() - 11, 40, 22);
+    triggerButton.setBounds (waveTitleArea.getX() + (traceButtons[0].isVisible() ? 260 : 160), waveTitleArea.getCentreY() - 11, 72, 22);
 
     const bool analysing = lastAnalysing;
-    for (auto* comp : std::initializer_list<juce::Component*> { &holdButton, &resetButton, &cutoffSlider,
+    for (auto* comp : std::initializer_list<juce::Component*> { &holdButton, &resetButton, &cutoffSlider, &waveZoom, &triggerButton,
                                                                 &viewButtons[0], &viewButtons[1], &viewButtons[2],
-                                                                &historyButtons[0], &historyButtons[1], &historyButtons[2] })
+                                                                &historyButtons[0], &historyButtons[1], &historyButtons[2], &historyButtons[3],
+                                                                &historyModeButtons[0], &historyModeButtons[1], &historyModeButtons[2] })
         comp->setVisible (analysing);
 }
 
@@ -479,17 +642,32 @@ void Panel::paintSpectrum (juce::Graphics& g, juce::Rectangle<int> area)
         if (! fromLink)
             return message (linkValid() ? tr (en, "Fenster öffnen sich …", "Collecting data …") : linkStateText (link.state, en));
 
+        g.setFont (font (12.0f));
+        g.setColour (c::good.withAlpha (0.8f));
+        g.drawText (tr (en, "gleichphasig", "in phase"), (int) r.getRight() - 110, (int) (r.getCentreY() - 16), 104, 14, juce::Justification::centredRight);
+        g.setColour (c::bad.withAlpha (0.8f));
+        g.drawText (tr (en, "gegenphasig", "opposite"), (int) r.getRight() - 110, (int) r.getY() + 2, 104, 14, juce::Justification::centredRight);
+
+        // Phase only means something where A and B have something in common: bands with a band
+        // correlation of at least 0.3 are drawn and joined, the others only as faint dots.
         juce::Path p;
         bool started = false;
+        double previous = 0.0;
         for (int b = 0; b < bandCount; ++b)
         {
             const double ph = link.spectrum.phase[(size_t) b];
+            const double coherence = std::abs (link.spectrum.correlation[(size_t) b]);
             if (ph <= noBand + 1.0) { started = false; continue; }
             const float x = (float) xOfFrequency (bandCentre (b), r);
             const float y = r.getY() + (float) ((180.0 - ph) / 360.0) * r.getHeight();
-            if (! started) p.startNewSubPath (x, y); else p.lineTo (x, y);
-            started = true;
-            g.setColour (c::a);
+            const bool clear = coherence >= 0.3;
+            if (clear && started && std::abs (ph - previous) < 180.0)
+                p.lineTo (x, y);
+            else if (clear)
+                p.startNewSubPath (x, y);
+            started = clear;
+            previous = ph;
+            g.setColour (c::a.withAlpha (clear ? 1.0f : 0.25f));
             g.fillEllipse (x - 3, y - 3, 6, 6);
         }
         g.setColour (c::a);
@@ -575,8 +753,10 @@ void Panel::paintSpectrum (juce::Graphics& g, juce::Rectangle<int> area)
         g.drawText ("A " + juce::String::fromUTF8 ("·") + " " + (link.a.name.empty() ? juce::String ("A") : juce::String::fromUTF8 (link.a.name.c_str()))
                         + "     /     B " + juce::String::fromUTF8 ("·") + " " + (link.b.name.empty() ? juce::String ("B") : juce::String::fromUTF8 (link.b.name.c_str())),
                     (int) r.getX() + 8, area.getY() + 4, 500, 16, juce::Justification::centredLeft);
-        drawCurve (g, link.spectrum.x, r, c::a, -72.0f, true);
-        drawCurve (g, link.spectrum.y, r, c::b, -72.0f, true);
+        if (traceButtons[0].getToggleState())
+            drawCurve (g, link.spectrum.x, r, c::a, -72.0f, true);
+        if (traceButtons[1].getToggleState())
+            drawCurve (g, link.spectrum.y, r, c::b, -72.0f, true);
         return;
     }
 
@@ -656,7 +836,7 @@ void Panel::paintReadout (juce::Graphics& g, juce::Rectangle<int> area)
                 r, juce::Justification::centredLeft);
     juce::String offset = tr (en, "Versatz ", "Offset ") + dash;
     if (valid && res.clearOffset && link.sampleRate > 0)
-        offset = tr (en, "Versatz ", "Offset ") + (res.offsetSamples > 0 ? "+" : "") + juce::String (res.offsetSamples) + " Samples ("
+        offset = tr (en, "Versatz ", "Offset ") + (res.offsetSamples > 0 ? "+" : "") + juce::String (res.offsetSamples) + tr (en, " Samples (", " samples (")
                  + number (1000.0 * res.offsetSamples / link.sampleRate, 2, en, true) + " ms)";
     g.drawText (offset, r, juce::Justification::centred);
     g.drawText ("A+B < " + frequency (cutoffSlider.getValue(), en) + "  " + (link.state == LinkState::valid && res.sumScore >= 0 ? juce::String (res.sumScore) + "/100" : dash),
@@ -672,22 +852,34 @@ void Panel::paintWaveform (juce::Graphics& g, juce::Rectangle<int> area)
     g.setColour (juce::Colour (0xff46515a));
     g.drawHorizontalLine (title.getY(), (float) title.getX(), (float) title.getRight());
 
-    const bool fromLink = linkValid() && link.waveLength > 0;
-    const float* x = fromLink ? link.waveA.data() : snapshot->waveLeft.data();
-    const float* y = fromLink ? link.waveB.data() : snapshot->waveRight.data();
-    const int n = fromLink ? link.waveLength : snapshot->waveLength;
+    const bool fromLink = linkValid() && link.wave.bins > 0;
+    const auto& w = fromLink ? link.wave : snapshot->wave;
+    const double windowMs = w.bins > 0 ? w.seconds * 1000.0 : waveZoom.getValue();
+
+    auto msText = [en] (double ms)
+    {
+        return ms < 10.0 ? number (ms, 1, en) + " ms" : juce::String (juce::roundToInt (ms)) + " ms";
+    };
 
     g.setFont (font (14.0f));
     g.setColour (c::text);
     g.drawText ("DUAL-WAVEFORM", title.reduced (13, 0), juce::Justification::centredLeft);
-    const auto keyA = fromLink ? juce::String ("A") : juce::String (tr (en, "L · links", "L · left"));
-    const auto keyB = fromLink ? juce::String ("B") : juce::String (tr (en, "R · rechts", "R · right"));
-    const int kx = title.getCentreX() - 80;
-    g.setColour (c::a); g.fillRect (kx, title.getCentreY() - 1, 18, 2);
-    g.setColour (c::sub); g.drawText (keyA, kx + 24, title.getY(), 70, title.getHeight(), juce::Justification::centredLeft);
-    g.setColour (c::b); g.fillRect (kx + 100, title.getCentreY() - 1, 18, 2);
-    g.setColour (c::sub); g.drawText (keyB, kx + 124, title.getY(), 80, title.getHeight(), juce::Justification::centredLeft);
-    g.drawText ("40 ms", title.reduced (13, 0), juce::Justification::centredRight);
+    if (! traceButtons[0].isVisible())
+    {
+        // Without the A/B switches: a plain colour key for the two curves.
+        const auto keyA = fromLink ? juce::String ("A") : tr (en, "L · links", "L · left");
+        const auto keyB = fromLink ? juce::String ("B") : tr (en, "R · rechts", "R · right");
+        const int kx = triggerButton.getRight() + 22;
+        g.setFont (font (13.5f));
+        g.setColour (c::a); g.fillRect (kx, title.getCentreY() - 1, 18, 2);
+        g.setColour (c::sub); g.drawText (keyA, kx + 24, title.getY(), 80, title.getHeight(), juce::Justification::centredLeft);
+        g.setColour (c::b); g.fillRect (kx + 100, title.getCentreY() - 1, 18, 2);
+        g.setColour (c::sub); g.drawText (keyB, kx + 124, title.getY(), 90, title.getHeight(), juce::Justification::centredLeft);
+    }
+    g.setColour (c::sub);
+    g.setFont (font (14.0f));
+    g.drawText (tr (en, "Zeitfenster ", "Window ") + msText (waveZoom.getValue()), waveZoom.getX() - 150, title.getY(), 142, title.getHeight(),
+                juce::Justification::centredRight);
 
     g.setColour (c::graph);
     g.fillRect (area);
@@ -707,11 +899,12 @@ void Panel::paintWaveform (juce::Graphics& g, juce::Rectangle<int> area)
         g.setColour (c::grid);
         g.drawVerticalLine ((int) xx, r.getY(), r.getBottom());
         g.setColour (c::sub);
-        const int bx = j == 0 ? (int) xx : j == 4 ? (int) xx - 60 : (int) xx - 30;
-        g.drawText (juce::String (j * 10) + (j == 4 ? " ms" : ""), bx, (int) r.getBottom() + 4, 60, 16,
+        const int bx = j == 0 ? (int) xx : j == 4 ? (int) xx - 70 : (int) xx - 35;
+        const double ms = windowMs * j / 4.0;
+        g.drawText (j == 0 ? juce::String ("0") : msText (ms), bx, (int) r.getBottom() + 4, 70, 16,
                     j == 0 ? juce::Justification::centredLeft : j == 4 ? juce::Justification::centredRight : juce::Justification::centred);
     }
-    if (n <= 1)
+    if (w.bins <= 1)
     {
         g.setColour (c::sub);
         g.setFont (font (15.0f));
@@ -719,21 +912,50 @@ void Panel::paintWaveform (juce::Graphics& g, juce::Rectangle<int> area)
         return;
     }
 
+    // Scale to the loudest sample shown; every bin draws the span from its lowest to its highest
+    // sample (a filled band for long windows, a plain line when a bin holds a single sample).
+    const bool show[] = { ! traceButtons[0].isVisible() || traceButtons[0].getToggleState(),
+                          ! traceButtons[1].isVisible() || traceButtons[1].getToggleState() };
     float top = 0.05f;
-    for (int i = 0; i < n; ++i)
-        top = juce::jmax (top, std::abs (x[i]), std::abs (y[i]));
+    bool singleSamples = true;
+    for (int i = 0; i < w.bins; ++i)
+    {
+        if (show[0])
+            top = juce::jmax (top, std::abs (w.minA[(size_t) i]), std::abs (w.maxA[(size_t) i]));
+        if (show[1])
+            top = juce::jmax (top, std::abs (w.minB[(size_t) i]), std::abs (w.maxB[(size_t) i]));
+        singleSamples = singleSamples && w.minA[(size_t) i] == w.maxA[(size_t) i];
+    }
+    auto xAt = [&r, &w] (int i) { return r.getX() + r.getWidth() * i / (float) (w.bins - 1); };
+    auto yAt = [&r, top] (float v) { return r.getCentreY() - v / top * r.getHeight() * 0.5f; };
+
     for (int s = 0; s < 2; ++s)
     {
-        const float* data = s == 0 ? x : y;
-        juce::Path p;
-        for (int i = 0; i < n; ++i)
+        if (! show[s])
+            continue;
+        const auto& lo = s == 0 ? w.minA : w.minB;
+        const auto& hi = s == 0 ? w.maxA : w.maxB;
+        const auto colour = s == 0 ? c::a : c::b;
+        if (singleSamples)
         {
-            const float px = r.getX() + r.getWidth() * i / (float) (n - 1);
-            const float py = r.getCentreY() - data[i] / top * r.getHeight() * 0.5f;
-            if (i == 0) p.startNewSubPath (px, py); else p.lineTo (px, py);
+            juce::Path p;
+            for (int i = 0; i < w.bins; ++i)
+                if (i == 0) p.startNewSubPath (xAt (i), yAt (hi[(size_t) i])); else p.lineTo (xAt (i), yAt (hi[(size_t) i]));
+            g.setColour (colour);
+            g.strokePath (p, juce::PathStrokeType (1.5f));
+            continue;
         }
-        g.setColour (s == 0 ? c::a : c::b);
-        g.strokePath (p, juce::PathStrokeType (1.5f));
+        juce::Path band;
+        band.startNewSubPath (xAt (0), yAt (hi[0]));
+        for (int i = 1; i < w.bins; ++i)
+            band.lineTo (xAt (i), yAt (hi[(size_t) i]));
+        for (int i = w.bins - 1; i >= 0; --i)
+            band.lineTo (xAt (i), yAt (lo[(size_t) i]));
+        band.closeSubPath();
+        g.setColour (colour.withAlpha (0.38f));
+        g.fillPath (band);
+        g.setColour (colour.withAlpha (0.85f));
+        g.strokePath (band, juce::PathStrokeType (1.0f));
     }
 }
 
@@ -821,7 +1043,9 @@ void Panel::paintMonitor (juce::Graphics& g, juce::Rectangle<int> area)
         g.setColour (c::sub);
         g.setFont (font (13.0f));
         g.drawText (cells[i].label, in.removeFromTop (16), juce::Justification::centredLeft);
-        g.setColour (i == 1 && lv.truePeak > -1.0 ? c::amber : c::text);
+        // At or above full scale in red, true peak above -1 dBTP in amber.
+        const double level = i == 0 ? lv.peak : i == 1 ? lv.truePeak : noLevel;
+        g.setColour (level >= 0.0 ? c::bad : (i == 1 && level > -1.0) ? c::amber : c::text);
         g.setFont (font (19.0f));
         g.drawText (cells[i].value, in, juce::Justification::centredLeft);
         const int w = juce::GlyphArrangement::getStringWidthInt (g.getCurrentFont(), cells[i].value);
@@ -829,6 +1053,16 @@ void Panel::paintMonitor (juce::Graphics& g, juce::Rectangle<int> area)
         g.setFont (font (12.5f));
         g.drawText (cells[i].unit, in.withTrimmedLeft (w + 5), juce::Justification::centredLeft);
     }
+
+    // Clipping since reset: count of clips (runs at or above 0 dBFS) and clipped samples
+    const auto clips = lv.clips();
+    g.setColour (clips > 0 ? c::bad.withAlpha (0.18f) : c::field);
+    g.fillRoundedRectangle (clipRect.toFloat(), 3.0f);
+    g.setColour (clips > 0 ? c::bad : c::sub);
+    g.setFont (font (13.5f));
+    g.drawFittedText (clips > 0 ? "Clips " + juce::String (clips) + " " + juce::String::fromUTF8 ("·") + " " + juce::String (lv.clippedSamples) + " Samples"
+                                : tr (en, "Clips 0", "Clips 0"),
+                      clipRect.reduced (6, 0), juce::Justification::centred, 1, 0.8f);
 }
 
 void Panel::paintMeters (juce::Graphics& g, juce::Rectangle<int> r)
@@ -837,9 +1071,19 @@ void Panel::paintMeters (juce::Graphics& g, juce::Rectangle<int> r)
     const int x0 = r.getX() + 4;
     const int top = r.getY() + 20, bottom = r.getBottom() - 18, height = bottom - top;
     g.setFont (font (12.5f));
-    g.setColour (c::sub);
-    g.drawText ("L", x0, r.getY(), bar, 16, juce::Justification::centred);
-    g.drawText ("R", x0 + bar + gap, r.getY(), bar, 16, juce::Justification::centred);
+    const auto now = juce::Time::getMillisecondCounter();
+    const bool clipLit[] = { now < clipLeftUntil, now < clipRightUntil };
+    for (int s = 0; s < 2; ++s)
+    {
+        const auto label = juce::Rectangle<int> (x0 + s * (bar + gap), r.getY(), bar, 16);
+        if (clipLit[s])
+        {
+            g.setColour (c::bad);
+            g.fillRoundedRectangle (label.toFloat(), 2.0f);
+        }
+        g.setColour (clipLit[s] ? juce::Colour (0xff1d2226) : c::sub);
+        g.drawText (s == 0 ? "L" : "R", label, juce::Justification::centred);
+    }
 
     const float levels[] = { meterLeft, meterRight }, holds[] = { peakHoldLeft, peakHoldRight };
     for (int s = 0; s < 2; ++s)
@@ -905,6 +1149,7 @@ void Panel::paintGoniometer (juce::Graphics& g, juce::Rectangle<int> area)
 void Panel::paintHistory (juce::Graphics& g, juce::Rectangle<int> area)
 {
     const bool en = english();
+    const int mode = historyMode();   // 0 correlation, 1 level, 2 loudness
     g.setColour (c::graph);
     g.fillRect (area);
     auto title = area.removeFromTop (32);
@@ -913,41 +1158,141 @@ void Panel::paintHistory (juce::Graphics& g, juce::Rectangle<int> area)
     g.setColour (c::text);
     g.setFont (font (14.0f));
     g.drawText ("HISTORY", title.reduced (13, 0), juce::Justification::centredLeft);
-    g.setColour (c::a); g.fillRect (title.getX() + 92, title.getCentreY() - 1, 16, 2);
-    g.setColour (c::sub);
-    g.setFont (font (13.0f));
-    g.drawText (tr (en, "L/R-Korrelation", "L/R correlation"), title.getX() + 112, title.getY(), 130, title.getHeight(), juce::Justification::centredLeft);
-    g.setColour (c::b); g.fillRect (title.getX() + 246, title.getCentreY() - 1, 16, 2);
-    g.setColour (c::sub);
-    g.drawText (tr (en, "Mono-Score", "Mono score"), title.getX() + 266, title.getY(), 100, title.getHeight(), juce::Justification::centredLeft);
+
+    // Legend of the two lines of this view, right of the view buttons
+    const juce::String names[3][2] = {
+        { tr (en, "L/R-Korrelation", "L/R correlation"), tr (en, "Mono-Score", "Mono score") },
+        { "RMS", "Peak" },
+        { tr (en, "LUFS kurz", "LUFS short"), tr (en, "LUFS momentan", "LUFS momentary") } };
+    int lx = historyModeButtons[0].getRight() + 18;
+    for (int line = 0; line < 2; ++line)
+    {
+        g.setColour (line == 0 ? c::a : c::b);
+        g.fillRect (lx, title.getCentreY() - 1, 16, 2);
+        g.setColour (c::sub);
+        g.setFont (font (13.0f));
+        g.drawText (names[mode][line], lx + 20, title.getY(), 120, title.getHeight(), juce::Justification::centredLeft);
+        lx += 20 + juce::GlyphArrangement::getStringWidthInt (g.getCurrentFont(), names[mode][line]) + 18;
+    }
+    if (mode != 0)
+    {
+        g.setColour (c::bad);
+        g.fillRect (lx, title.getCentreY() - 4, 3, 8);
+        g.setColour (c::sub);
+        g.drawText ("Clip", lx + 8, title.getY(), 40, title.getHeight(), juce::Justification::centredLeft);
+        lx += 52;
+    }
     if (juce::Time::getMillisecondCounter() < gapShownUntil)
     {
         g.setColour (c::amber);
-        g.drawText (tr (en, "Lücke: Analyse kam nicht hinterher", "Gap: the analysis could not keep up"), title.getX() + 380, title.getY(), 300, title.getHeight(), juce::Justification::centredLeft);
+        g.drawText (tr (en, "Lücke: Analyse kam nicht hinterher", "Gap: the analysis could not keep up"), lx + 10, title.getY(), 260, title.getHeight(), juce::Justification::centredLeft);
     }
 
     auto r = area.toFloat().withTrimmedLeft (46).withTrimmedRight (18).withTrimmedTop (8).withTrimmedBottom (22);
-    for (int v : { 1, 0, -1 })
+    // 30/60/90 s: the newest 100 ms points; Song: one point per second since the last reset.
+    const bool song = historySeconds == 0;
+    const int count = song ? (int) songPoints.size() : historySeconds * 10;
+    const History::Point* points = song ? songPoints.data() : snapshot->history.data() + (History::points - count);
+    if (count < 2)
     {
-        const float y = r.getCentreY() - v * r.getHeight() * 0.5f;
-        g.setColour (c::grid);
-        g.drawHorizontalLine ((int) y, r.getX(), r.getRight());
         g.setColour (c::sub);
-        g.setFont (font (12.0f));
-        g.drawText (v > 0 ? "+1" : v < 0 ? juce::String::fromUTF8 ("−1") : juce::String ("0"), (int) r.getX() - 44, (int) y - 7, 38, 14, juce::Justification::centredRight);
+        g.setFont (font (14.0f));
+        g.drawText (tr (en, "Noch kein Verlauf – er beginnt mit der Wiedergabe.", "No history yet – it starts with playback."),
+                    r.toNearestInt(), juce::Justification::centred);
+        return;
     }
 
-    const int count = historySeconds * 10;
-    const History::Point* points = snapshot->history.data() + (History::points - count);
+    // Levels and loudness: the scale follows what is visible. The bottom sits a little below the
+    // quiet end (the lowest 5 % – short silences – are ignored), in 6 dB steps, 24 … 60 dB span;
+    // the top is 0 dB, or +6 dB when something went over.
+    float top = 0.0f, bottom = -60.0f;
+    if (mode == 0)
+    {
+        // Correlation: from a little below the lowest visible value (in 0.25 steps) up to +1 with some
+        // headroom, so a mono signal does not hide on the top edge.
+        float lowest = 1.0f;
+        for (int i = 0; i < count; ++i)
+            if (points[i].valid)
+                lowest = std::min (lowest, points[i].value);
+        top = 1.1f;
+        bottom = juce::jlimit (-1.0f, 0.5f, std::floor ((lowest - 0.1f) / 0.25f) * 0.25f);
+    }
+    else
+    {
+        std::vector<float> values;
+        values.reserve ((size_t) count * 2);
+        for (int i = 0; i < count; ++i)
+        {
+            const auto& pt = points[i];
+            for (float v : { mode == 1 ? pt.rms : pt.shortTerm, mode == 1 ? pt.peak : pt.momentary })
+                if (v > -200.0f)
+                    values.push_back (v);
+        }
+        if (! values.empty())
+        {
+            std::sort (values.begin(), values.end());
+            const float quiet = values[(size_t) (values.size() / 20)];
+            top = values.back() > 0.0f ? 6.0f : 0.0f;
+            bottom = juce::jlimit (top - 60.0f, top - 24.0f, std::floor ((quiet - 3.0f) / 6.0f) * 6.0f);
+        }
+    }
+
+    // Vertical scale: correlation -1 … +1, levels and loudness bottom … top dB
+    auto yOf = [&r, top, bottom] (float v)
+    {
+        return r.getY() + juce::jlimit (0.0f, 1.0f, (top - v) / (top - bottom)) * r.getHeight();
+    };
+    // Mono score on its own axis (right): 0 … 110, so 100 sits just below the top.
+    auto yOfScore = [&r] (float score) { return r.getY() + juce::jlimit (0.0f, 1.0f, (110.0f - score) / 110.0f) * r.getHeight(); };
+    g.setFont (font (12.0f));
+    if (mode == 0)
+    {
+        for (float v = 1.0f; v >= bottom - 0.01f; v -= 0.25f)
+        {
+            g.setColour (std::abs (v) < 0.01f ? c::bad.withAlpha (0.45f) : c::grid);   // below 0: working against each other
+            g.drawHorizontalLine ((int) yOf (v), r.getX(), r.getRight());
+        }
+        const float middle = std::round ((1.0f + bottom) / 0.5f) * 0.25f;
+        for (float v : { 1.0f, middle, bottom })
+        {
+            g.setColour (c::sub);
+            g.drawText (number (v, 2, en, v > 0.0f), (int) r.getX() - 46, (int) yOf (v) - 7, 42, 14, juce::Justification::centredRight);
+        }
+        g.setColour (c::b.withAlpha (0.8f));
+        for (int s : { 100, 50, 0 })
+            g.drawText (juce::String (s), (int) r.getRight() - 30, (int) yOfScore ((float) s) - 7, 27, 14, juce::Justification::centredRight);
+    }
+    else
+    {
+        for (float v = top; v >= bottom - 0.01f; v -= 6.0f)
+        {
+            g.setColour (v == 0.0f && top > 0.0f ? c::bad.withAlpha (0.5f) : c::grid);
+            g.drawHorizontalLine ((int) yOf (v), r.getX(), r.getRight());
+        }
+        const float middle = std::round ((top + bottom) / 12.0f) * 6.0f;
+        for (float v : { top, middle, bottom })
+        {
+            g.setColour (c::sub);
+            g.drawText (number (v, 0, en, v > 0.0f), (int) r.getX() - 44, (int) yOf (v) - 7, 38, 14, juce::Justification::centredRight);
+        }
+    }
+
+    auto xOf = [&r, count] (int i) { return r.getX() + r.getWidth() * i / (float) (count - 1); };
     for (int j = 0; j <= 4; ++j)
     {
         const float x = r.getX() + r.getWidth() * j / 4.0f;
         g.setColour (c::grid);
         g.drawVerticalLine ((int) x, r.getY(), r.getBottom());
         const int index = juce::jlimit (0, count - 1, (int) std::lround ((count - 1) * j / 4.0));
-        const int ago = juce::roundToInt (historySeconds * (1.0 - j / 4.0));
-        juce::String label = j == 4 ? tr (en, "Jetzt", "Now") : juce::String::fromUTF8 ("−") + juce::String (ago) + " s";
-        if (points[index].valid && points[index].bar >= 1.0)
+        juce::String label;
+        if (song)
+            label = juce::String (index / 60) + ":" + juce::String (index % 60).paddedLeft ('0', 2);   // one point per second
+        else
+        {
+            const int ago = juce::roundToInt (historySeconds * (1.0 - j / 4.0));
+            label = j == 4 ? tr (en, "Jetzt", "Now") : juce::String::fromUTF8 ("−") + juce::String (ago) + " s";
+        }
+        if (points[index].bar >= 1.0)
             label << tr (en, " · T. ", " · bar ") << juce::String ((int) std::floor (points[index].bar));
         g.setColour (c::sub);
         const int bx = j == 0 ? (int) x : j == 4 ? (int) x - 140 : (int) x - 70;
@@ -955,30 +1300,132 @@ void Panel::paintHistory (juce::Graphics& g, juce::Rectangle<int> area)
                     j == 0 ? juce::Justification::centredLeft : j == 4 ? juce::Justification::centredRight : juce::Justification::centred);
     }
 
+    // Value of a line at one point, or "no value"
+    auto valueOf = [mode] (const History::Point& pt, int line, float& v)
+    {
+        if (mode == 0)
+        {
+            if (! pt.valid)
+                return false;
+            v = line == 0 ? pt.value : pt.second / 50.0f - 1.0f;
+            return line == 0 || pt.second >= 0.0f;
+        }
+        v = mode == 1 ? (line == 0 ? pt.rms : pt.peak) : (line == 0 ? pt.shortTerm : pt.momentary);
+        return v > -200.0f;
+    };
+
+    // Display smoothing only (the points keep their 100 ms values): a moving average over about
+    // 0.6 s at 30 s, wider for longer views; the peak line follows a moving maximum first, so it
+    // stays an honest envelope of the peaks.
+    const int half = song ? 1 : historySeconds <= 30 ? 3 : historySeconds <= 60 ? 5 : 7;
+    std::vector<float> raw ((size_t) count), shaped ((size_t) count);
+    std::vector<char> present ((size_t) count);
     for (int line = 0; line < 2; ++line)
     {
-        juce::Path p;
-        bool started = false;
         for (int i = 0; i < count; ++i)
         {
-            const auto& pt = points[i];
-            const float value = line == 0 ? pt.value : (pt.second < 0 ? -2.0f : pt.second / 50.0f - 1.0f);
-            if (! pt.valid || value < -1.5f) { started = false; continue; }
-            const float x = r.getX() + r.getWidth() * i / (float) (count - 1);
-            const float y = r.getCentreY() - juce::jlimit (-1.0f, 1.0f, value) * r.getHeight() * 0.5f;
-            if (! started) p.startNewSubPath (x, y); else p.lineTo (x, y);
+            float v = 0.0f;
+            present[(size_t) i] = valueOf (points[i], line, v) ? 1 : 0;
+            raw[(size_t) i] = v;
+        }
+        const bool envelope = mode == 1 && line == 1;
+        if (envelope)
+        {
+            for (int i = 0; i < count; ++i)
+            {
+                float m = -1000.0f;
+                for (int k = std::max (0, i - half); k <= std::min (count - 1, i + half); ++k)
+                    if (present[(size_t) k])
+                        m = std::max (m, raw[(size_t) k]);
+                shaped[(size_t) i] = m;
+            }
+            raw = shaped;
+        }
+        for (int i = 0; i < count; ++i)
+        {
+            double sum = 0.0;
+            int n = 0;
+            for (int k = std::max (0, i - half); k <= std::min (count - 1, i + half); ++k)
+                if (present[(size_t) k])
+                {
+                    sum += raw[(size_t) k];
+                    ++n;
+                }
+            shaped[(size_t) i] = n > 0 ? (float) (sum / n) : 0.0f;
+        }
+
+        juce::Path p;
+        bool started = false;
+        const bool scoreLine = mode == 0 && line == 1;
+        for (int i = 0; i < count; ++i)
+        {
+            if (! present[(size_t) i]) { started = false; continue; }
+            const float v = shaped[(size_t) i];
+            const float y = scoreLine ? yOfScore ((v + 1.0f) * 50.0f) : yOf (v);
+            if (! started) p.startNewSubPath (xOf (i), y); else p.lineTo (xOf (i), y);
             started = true;
         }
-        g.setColour (line == 0 ? c::a : c::b.withAlpha (0.7f));
-        g.strokePath (p, juce::PathStrokeType (line == 0 ? 1.6f : 1.2f));
+        // Like a loudness meter's timeline: short-term loudness and the peak envelope as filled areas.
+        const bool filled = (mode == 2 && line == 0) || (mode == 1 && line == 1);
+        if (filled)
+        {
+            juce::Path fill;
+            bool open = false;
+            int last = 0;
+            for (int i = 0; i <= count; ++i)
+            {
+                const bool here = i < count && present[(size_t) i];
+                if (here && ! open)
+                {
+                    fill.startNewSubPath (xOf (i), r.getBottom());
+                    open = true;
+                }
+                if (here)
+                {
+                    fill.lineTo (xOf (i), yOf (shaped[(size_t) i]));
+                    last = i;
+                }
+                if (! here && open)
+                {
+                    fill.lineTo (xOf (last), r.getBottom());
+                    fill.closeSubPath();
+                    open = false;
+                }
+            }
+            const auto colour = line == 0 ? c::a : c::b;
+            g.setGradientFill (juce::ColourGradient (colour.withAlpha (0.55f), 0, r.getY(), colour.withAlpha (0.12f), 0, r.getBottom(), false));
+            g.fillPath (fill);
+        }
+        g.setColour (line == 0 ? c::a : c::b.withAlpha (0.8f));
+        g.strokePath (p, juce::PathStrokeType (line == 0 ? 1.7f : 1.3f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+    }
+
+    if (mode == 2 && snapshot->levels.integrated > noLevel + 1.0)
+    {
+        // Integrated loudness since reset as a dashed line with its value.
+        const float y = yOf ((float) snapshot->levels.integrated);
+        const float dashes[] = { 6.0f, 4.0f };
+        g.setColour (c::text.withAlpha (0.7f));
+        g.drawDashedLine (juce::Line<float> (r.getX(), y, r.getRight(), y), dashes, 2, 1.2f);
+        g.setFont (font (12.5f));
+        g.drawText (tr (en, "Integriert ", "Integrated ") + number (snapshot->levels.integrated, 1, en) + " LUFS",
+                    (int) r.getX() + 6, (int) y - 16, 200, 14, juce::Justification::centredLeft);
+    }
+
+    if (mode != 0)
+    {
+        // Clipping in red: a mark at the top for every point with a sample at or above 0 dBFS.
+        g.setColour (c::bad);
+        const float w = juce::jlimit (2.0f, 3.0f, r.getWidth() / count);   // thin marks, also with few points
+        for (int i = 0; i < count; ++i)
+            if (points[i].clipped)
+                g.fillRect (xOf (i) - w * 0.5f, r.getY() - 6.0f, w, r.getHeight() * 0.25f + 6.0f);
     }
 }
 
 void Panel::paintAdvice (juce::Graphics& g, juce::Rectangle<int> area)
 {
-    const bool en = english();
-    const OwnInput in { *snapshot, fullScore, bandScore, cutoffSlider.getValue() };
-    const auto advice = isChannel ? adviseOwnInput (in, en) : adviseBus (in, link, en);
+    const auto& advice = shownAdvice;
     g.setColour (c::adviceBack);
     g.fillRect (area);
     g.setColour (juce::Colour (0xff5d594c));

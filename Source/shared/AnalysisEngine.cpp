@@ -9,6 +9,110 @@ AnalysisEngine::AnalysisEngine (const MonoScoreMeter& monoMeter)
       ringLeft ((size_t) waveformCapacity, 0.0f), ringRight ((size_t) waveformCapacity, 0.0f),
       building (std::make_unique<EngineSnapshot>()), snapshot (std::make_unique<EngineSnapshot>())
 {
+    longHistory.reserve ((size_t) longHistoryCapacity);
+}
+
+void WaveformBins::fill (const float* a, const float* b, int capacity, int end, int count, double rate, int maxBack) noexcept
+{
+    count = std::clamp (count, 0, capacity);
+    maxBack = std::clamp (maxBack, 0, capacity - count);
+    triggered = false;
+    auto at = [capacity] (const float* x, int i) { return x[((i % capacity) + capacity) % capacity]; };
+
+    if (maxBack > 0 && rate > 0.0)
+    {
+        // Two one-pole low-passes at 150 Hz: the trigger follows the bass, not the hiss.
+        const float k = 1.0f - std::exp (-2.0f * 3.14159265f * 150.0f / (float) rate);
+        const int latest = end - count, earliest = latest - maxBack;
+        const int warm = std::min ((int) (0.01 * rate), capacity - count - maxBack);
+        float y1 = 0.0f, y2 = 0.0f, previous = 0.0f, level = 0.0f;
+        int found = -1;
+        for (int i = earliest - warm; i <= latest; ++i)
+        {
+            y1 += k * (at (a, i) - y1);
+            y2 += k * (y1 - y2);
+            if (i > earliest)
+            {
+                level = std::max (level, std::abs (y2));
+                if (previous < 0.0f && y2 >= 0.0f)
+                    found = i;   // keep the latest crossing: freshest picture
+            }
+            previous = y2;
+        }
+        if (found >= 0 && level > 1.0e-3f)
+        {
+            // The filters lag: step back to the real rising zero crossing just before (within 10 ms).
+            for (int i = found; i > std::max (earliest, found - (int) (0.01 * rate)); --i)
+                if (at (a, i - 1) < 0.0f && at (a, i) >= 0.0f)
+                {
+                    found = i;
+                    break;
+                }
+            end = found + count;
+            triggered = true;
+        }
+    }
+
+    bins = std::min (waveformBins, count);
+    seconds = rate > 0.0 ? count / rate : 0.0;
+    for (int bin = 0; bin < bins; ++bin)
+    {
+        const int from = (int) ((long long) bin * count / bins), to = std::max (from + 1, (int) ((long long) (bin + 1) * count / bins));
+        float loA = 1.0e9f, hiA = -1.0e9f, loB = 1.0e9f, hiB = -1.0e9f;
+        for (int i = from; i < to; ++i)
+        {
+            const int j = ((end - count + i) % capacity + capacity) % capacity;
+            loA = std::min (loA, a[j]); hiA = std::max (hiA, a[j]);
+            loB = std::min (loB, b[j]); hiB = std::max (hiB, b[j]);
+        }
+        minA[(size_t) bin] = loA; maxA[(size_t) bin] = hiA;
+        minB[(size_t) bin] = loB; maxB[(size_t) bin] = hiB;
+    }
+}
+
+void AnalysisEngine::copyLongHistory (std::vector<History::Point>& out) const
+{
+    const juce::SpinLock::ScopedLockType lock (longLock);
+    out = longHistory;   // the caller keeps its vector, so this reuses its memory
+}
+
+void AnalysisEngine::addToLongHistory (const History::Point& p, bool recording)
+{
+    if (! recording)
+        return;
+    if (longCount == 0)
+        longAccumulator = {};
+    ++longCount;
+    if (p.valid)
+    {
+        ++longValid;
+        longCorrelation += p.value;
+        longAccumulator.valid = true;
+    }
+    if (p.second >= 0.0f) { longScore += p.second; ++longScoreCount; }
+    if (p.rms > -200.0f) { longRms += p.rms; ++longRmsCount; }
+    longAccumulator.peak = std::max (longAccumulator.peak, p.peak);
+    longAccumulator.momentary = std::max (longAccumulator.momentary, p.momentary);
+    longAccumulator.shortTerm = p.shortTerm;
+    longAccumulator.clipped = longAccumulator.clipped || p.clipped;
+    if (longAccumulator.bar < 0.0)
+        longAccumulator.bar = p.bar;
+
+    if (longCount < 10)
+        return;
+    auto point = longAccumulator;
+    point.value = longValid > 0 ? (float) (longCorrelation / longValid) : 0.0f;
+    point.second = longScoreCount > 0 ? (float) (longScore / longScoreCount) : -1.0f;
+    point.rms = longRmsCount > 0 ? (float) (longRms / longRmsCount) : (float) noLevel;
+    longCount = longValid = longScoreCount = longRmsCount = 0;
+    longCorrelation = longScore = longRms = 0.0;
+    {
+        const juce::SpinLock::ScopedLockType lock (longLock);
+        if ((int) longHistory.size() >= longHistoryCapacity)
+            longHistory.erase (longHistory.begin());   // once a second, after two hours: acceptable
+        longHistory.push_back (point);
+    }
+    ++longVersion;
 }
 
 AnalysisEngine::~AnalysisEngine()
@@ -26,6 +130,12 @@ void AnalysisEngine::prepare (double sampleRate)
     stereo.prepare (rate);
     spectrum.prepare (rate);
     history.clear();
+    {
+        const juce::SpinLock::ScopedLockType lock (longLock);
+        longHistory.clear();
+    }
+    longCount = 0;
+    ++longVersion;
     frameFill = 0;
     std::fill (ringLeft.begin(), ringLeft.end(), 0.0f);
     std::fill (ringRight.begin(), ringRight.end(), 0.0f);
@@ -98,6 +208,12 @@ void AnalysisEngine::processPending()
     {
         levels.reset();
         history.clear();
+        {
+            const juce::SpinLock::ScopedLockType lock (longLock);
+            longHistory.clear();
+        }
+        longCount = 0;
+        ++longVersion;
     }
 
     const bool display = displayUsers.load() > 0;
@@ -114,6 +230,7 @@ void AnalysisEngine::processPending()
         overflowSinceLastPoint = true;
 
     chunkPeakLeft = chunkPeakRight = 0.0f;
+    chunkClipLeft = chunkClipRight = false;
     for (;;)
     {
         const int ready = fifo.getNumReady();
@@ -140,6 +257,9 @@ void AnalysisEngine::processChunk (const float* left, const float* right, int n)
     {
         chunkPeakLeft = std::max (chunkPeakLeft, std::abs (left[i]));
         chunkPeakRight = std::max (chunkPeakRight, std::abs (right[i]));
+        pointPeak = std::max (pointPeak, std::max (std::abs (left[i]), std::abs (right[i])));
+        chunkClipLeft = chunkClipLeft || std::abs (left[i]) >= 1.0f;
+        chunkClipRight = chunkClipRight || std::abs (right[i]) >= 1.0f;
         ringLeft[(size_t) ringPosition] = left[i];
         ringRight[(size_t) ringPosition] = right[i];
         ringPosition = (ringPosition + 1) % waveformCapacity;
@@ -150,7 +270,7 @@ void AnalysisEngine::processChunk (const float* left, const float* right, int n)
             frameRight[(size_t) frameFill] = right[i];
             if (++frameFill == spectrumSize)
             {
-                spectrum.addFrame (frameLeft.data(), frameRight.data(), 0.6);
+                spectrum.addFrame (frameLeft.data(), frameRight.data(), 0.8);   // about 100 ms: calm, still follows the music
                 // hop of a quarter frame: keep the newest three quarters
                 const int keep = spectrumSize - spectrumSize / 4;
                 std::copy (frameLeft.begin() + spectrumSize / 4, frameLeft.end(), frameLeft.begin());
@@ -173,7 +293,16 @@ void AnalysisEngine::processChunk (const float* left, const float* right, int n)
                 const double barLength = 4.0 * latestNumerator.load() / std::max (1, latestDenominator.load());
                 p.bar = latestPpq.load() / barLength + 1.0;
             }
+            const auto lv = levels.values();
+            p.peak = pointPeak > 0.0f ? 20.0f * std::log10 (pointPeak) : (float) noLevel;
+            p.rms = (float) lv.rms;
+            p.momentary = (float) lv.momentary;
+            p.shortTerm = (float) lv.shortTerm;
+            p.clipped = pointPeak >= 1.0f;
+            pointPeak = 0.0f;
             history.push (p);
+            // Record while the host plays; hosts without a transport: while there is signal.
+            addToLongHistory (p, latestPlaying.load() || (! latestHasPosition.load() && st.valid));
             overflowSinceLastPoint = false;
         }
     }
@@ -190,21 +319,20 @@ void AnalysisEngine::publish (bool hadOverflow)
     {
         next->spectrum = spectrum.result();
         stereo.copyScope (next->scopeMid, next->scopeSide);
-        next->waveLength = std::min (waveformCapacity, (int) std::lround (0.040 * rate));
-        for (int i = 0; i < next->waveLength; ++i)
-        {
-            const int j = (ringPosition - next->waveLength + i + waveformCapacity) % waveformCapacity;
-            next->waveLeft[(size_t) i] = ringLeft[(size_t) j];
-            next->waveRight[(size_t) i] = ringRight[(size_t) j];
-        }
+        const double seconds = juce::jlimit (waveformMinSeconds, waveformMaxSeconds, waveSeconds.load());
+        const int count = std::min (waveformCapacity, std::max (2, (int) std::lround (seconds * rate)));
+        const int back = waveTrigger.load() ? (int) (0.05 * rate) : 0;   // up to one 20 Hz cycle earlier
+        next->wave.fill (ringLeft.data(), ringRight.data(), waveformCapacity, ringPosition, count, rate, back);
     }
     else
     {
         next->spectrum = {};
-        next->waveLength = 0;
+        next->wave.bins = 0;
     }
     next->meterLeft = chunkPeakLeft;
     next->meterRight = chunkPeakRight;
+    next->clipLeft = chunkClipLeft;
+    next->clipRight = chunkClipRight;
     history.copy (next->history.data(), History::points);
     next->overflow = hadOverflow;
 

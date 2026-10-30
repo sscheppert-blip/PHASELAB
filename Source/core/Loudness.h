@@ -24,6 +24,11 @@ struct LevelValues
     double shortTerm = noLevel;   // LUFS
     double integrated = noLevel;  // LUFS
     double range = noLevel;       // LU (loudness range)
+
+    // Clipping since reset: a clip is a run of samples at or above 0 dBFS in one channel.
+    long long clipsLeft = 0, clipsRight = 0;
+    long long clippedSamples = 0;
+    long long clips() const noexcept { return clipsLeft + clipsRight; }
 };
 
 class Biquad
@@ -101,6 +106,8 @@ private:
     int blocksDone = 0;
 
     double peakHold = 0.0, truePeakHold = 0.0;
+    long long clipsLeft = 0, clipsRight = 0, clippedSamples = 0;
+    bool inClipLeft = false, inClipRight = false;
     std::vector<double> integratedEnergy, rangeEnergy;
     std::vector<long long> integratedCount, rangeCount;
 };

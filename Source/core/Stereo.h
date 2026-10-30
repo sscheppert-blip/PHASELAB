@@ -50,6 +50,12 @@ public:
         float value = 0.0f;
         float second = 0.0f;   // e.g. the mono score, 0 … 100, < 0 = none
         double bar = -1.0;     // bar position (1-based, fractional) when the host provides it
+        // Levels of the same 100 ms (dB; -1000 = no value)
+        float peak = -1000.0f;       // dBFS, highest sample of these 100 ms
+        float rms = -1000.0f;        // dBFS, 300 ms
+        float momentary = -1000.0f;  // LUFS, 400 ms
+        float shortTerm = -1000.0f;  // LUFS, 3 s
+        bool clipped = false;        // a sample at or above 0 dBFS in these 100 ms
     };
 
     void push (const Point& p) noexcept;

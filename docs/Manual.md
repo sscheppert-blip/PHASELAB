@@ -11,7 +11,7 @@ check. There are two plugins:
 PhaseLab only analyses – your audio passes through unchanged. The one exception is the **MONO**
 listening switch (see below).
 
-> Version 0.1.0. Tested with its own tests and pluginval on Windows. Not yet tested in DAWs or on
+> Version 0.1.1. Tested with its own tests and pluginval on Windows. Not yet tested in DAWs or on
 > macOS/Linux.
 
 ## 1. Installation
@@ -76,13 +76,24 @@ The buttons above the big graph choose what it shows:
   narrow peak marked; in the Bus Analyzer A and B on top of each other while the comparison is valid,
   otherwise its own input.
 - **Stereo M/S** (Channel Analyzer) – mid and side signal separately.
-- **Phase A/B** (Bus Analyzer) – the phase of B relative to A per third octave.
+- **Phase A/B** (Bus Analyzer) – how many degrees B is shifted against A per third octave. 0° is in
+  phase (adds up), ±180° opposite (cancels). A time offset shows as a line falling with frequency.
+  Only bands where A and B have something in common (band correlation from 0.3) are drawn clearly,
+  the others faintly – few for kick vs. bass, nearly all for bass DI vs. amp or two mics on one drum.
 - **Mono loss** – how many dB the mono sum loses per frequency band. Zero means nothing is lost.
 
 **Band strip** below the graph: correlation per third octave – green in phase, red cancelling, grey too
 quiet. In the Channel Analyzer between L and R, in the Bus Analyzer between A and B.
 
-**Dual waveform**: the last 40 ms of L/R or A/B on the same time axis.
+**Dual waveform**: L/R or A/B on the same time axis. The slider in its title bar sets the window from
+2 ms (single cycles and samples) to 400 ms (many bass cycles, kick and bass together); double-click
+resets to 40 ms. In long windows every point shows the span from the lowest to the highest value, like
+a DAW waveform. The setting is saved with the project.
+
+In the Bus Analyzer the **A** and **B** switches hide a curve – in the waveform and the A/B spectrum
+(they appear while the A/B comparison is valid). **Trigger** (on by default) starts every picture at a rising zero crossing of the
+low end of A or L, like an oscilloscope: periodic signals stand still, so you can compare the peaks and
+valleys of A and B at leisure.
 
 **HOLD** freezes the display; the audio keeps running.
 
@@ -94,16 +105,38 @@ quiet. In the Channel Analyzer between L and R, in the Bus Analyzer between A an
   for wide pads). A hint, not a verdict on quality.
 - **below … Hz**: the same score for the low end only; move the cutoff between 40 and 500 Hz with the
   slider (default 120 Hz).
-- **L/R correlation**, **goniometer**, **side** share and **balance**.
+- **L/R correlation**, **goniometer**, **side** share and **balance**. Note: in most DAWs a track's pan
+  acts *after* the insert plugins, so the Channel Analyzer sees the unpanned signal – a mono track stays
+  centred. The Bus Analyzer shows the panned sum.
 - **Peak**, **true peak**, **RMS** (300 ms), **LUFS short** (3 s), **LUFS integrated** and **LRA** after
   ITU-R BS.1770 / EBU R128. True peak above −1 dBTP turns orange.
 - **Reset measurement** restarts peak, true peak, integrated loudness, LRA and history.
 
 ## 6. History
 
-The L/R correlation (teal) and mono score (sand) of the last 30, 60 or 90 seconds. When the host
-provides bars and tempo, the time axis also shows the bar ("bar 33"), so you find the spot in the
-arrangement again.
+The history shows the course over time, much like a loudness meter's timeline. The buttons on the
+left choose what it shows (saved with the project):
+
+- **Loudness** (default) – LUFS short-term as a filled area, LUFS momentary as a line and the integrated
+  loudness since the last reset as a dashed line with its value
+- **Level** – peak as a filled envelope, RMS as a line, in dBFS
+- **Correlation** – L/R correlation and mono score (own axis on the right, 0–100)
+
+Clips are marked red in loudness and level. On the right you pick the time range: **30, 60 or 90 s**
+(the last seconds in fine resolution) or **Song** – the whole course since the last reset, up to two
+hours, with minutes and bars on the time axis. It records while the host plays; stops leave no gaps.
+"Reset measurement" starts it anew.
+
+The curves are smoothed for reading and the scale follows the visible material. When the host
+provides bars and tempo, the time axis also shows the bar ("bar 33").
+
+## Clipping
+
+A sample at or above 0 dBFS counts as clipping; consecutive clipped samples are one clip. PhaseLab
+shows a red clip LED above the meter of that channel (lit for 3 seconds), the counter "Clips N · M
+samples" since the last reset (red once anything clipped), peak and true peak in red from 0 dB, red
+marks in the history (level view) and "Clipping" as the first hint while it clipped in the last 3
+seconds. "Reset measurement" clears the counter.
 
 ## 7. Hints
 
